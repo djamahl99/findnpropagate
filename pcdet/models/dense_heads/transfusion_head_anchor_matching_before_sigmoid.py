@@ -257,7 +257,7 @@ class PatchSampleLayer(nn.Module):
 
         return xs
 
-class TransFusionHeadAnchorMatching(nn.Module):
+class TransFusionHeadAnchorMatchingSigmoid(nn.Module):
     """
         This module implements TransFusionHead.
         The code is adapted from https://github.com/mit-han-lab/bevfusion/ with minimal modifications.
@@ -266,7 +266,7 @@ class TransFusionHeadAnchorMatching(nn.Module):
         self,
         model_cfg, input_channels, num_class, class_names, grid_size, point_cloud_range, voxel_size, predict_boxes_when_training=True,
     ):
-        super(TransFusionHeadAnchorMatching, self).__init__()
+        super(TransFusionHeadAnchorMatchingSigmoid, self).__init__()
 
         self.grid_size = grid_size
         self.point_cloud_range = point_cloud_range
@@ -338,7 +338,7 @@ class TransFusionHeadAnchorMatching(nn.Module):
         # self.anchor_distribution = Normal(self.anchors.mean(), self.anchors.std())
         # self.anchor_distribution = torch.distributions.Exponential(1/self.anchors.mean())
 
-        self.anchor_size_bins = 20
+        self.anchor_size_bins = 30
         self.initialize_vector_values()
 
         self.orig_vector_values = self.vector_values.clone()
@@ -521,10 +521,10 @@ class TransFusionHeadAnchorMatching(nn.Module):
         # normalize the object size prediction
         dense_heatmap = dense_heatmap.clone() / (1e-8 + torch.norm(dense_heatmap.clone(), dim=1, keepdim=True))
         
+        regression_heatmap = dense_heatmap.clone()
 
         N, T, H, W = dense_heatmap.shape
         dense_heatmap = rearrange(dense_heatmap, 'N T H W -> (N H W) T')
-        regression_heatmap = dense_heatmap.clone()
 
         # text_features = self.text_features.to(dense_heatmap.dtype)
 
@@ -810,26 +810,14 @@ class TransFusionHeadAnchorMatching(nn.Module):
             loss_all += loss_agnostic_heatmap * self.loss_heatmap_weight
 
         # regression heatmap loss
-        # hm_reg = heatmap.clone().permute(0, 2, 3, 1).reshape(-1, C) @ self.anchors[self.known_class_idx]
         hm_reg = heatmap.clone().permute(0, 2, 3, 1).reshape(-1, C) @ self.anchor_vecs_normed[self.known_class_idx]
+        hm_reg = hm_reg.reshape(N, H, W, self.text_dim).permute(0, 3, 1, 2)
 
-        # hm_reg = hm_reg.clone().reshape(N, H, W, -1).permute(0, 3, 1, 2)
-        # save_image(hm_reg_img, 'hm_reg.png', normalize=True)
+        # save_image(hm_reg.clone().sum(dim=1), 'hm_reg_1.png')
         
-        # loss_reg_hmp = F.l1_loss(pred_dicts["regression_heatmap"], hm_reg)
-        # loss_dict["loss_regression_heatmap"] = loss_reg_hmp.item() #* self.loss_heatmap_weight * 0.1
-        # loss_all += loss_reg_hmp * self.loss_heatmap_weight
-
-        # hm_positive_anchors = self.soft_relu_bin_vectors(hm_reg)
-        # hm_positive_anchors = hm_positive_anchors.clone() / (1e-8 + torch.norm(hm_positive_anchors.clone(), dim=1, keepdim=True))
-
-        # hm_diag_weights = torch.ones((N, N), device='cuda') * (1.0 - torch.eye(N, device='cuda'))
-        # hm_label_weights = 1.0 * torch.eye(N, device='cuda') + (1.0 / N) * hm_diag_weights
-        # hm_dense_labels = 2 * torch.eye(N, device='cuda') - torch.ones((N, N), device='cuda') # -1 with diagonal 1
-
-        # heatmap_embs = pred_dicts["regression_heatmap"]
-        # hm_logits = heatmap_embs @ hm_positive_anchors.t() * self.hm_logit_scale().exp() + self.hm_logit_bias()
-        # loss_heatmap = - torch.sum(hm_label_weights * F.logsigmoid(hm_dense_labels * hm_logits)) / N
+        loss_reg_hmp = F.l1_loss(pred_dicts["regression_heatmap"], hm_reg)
+        loss_dict["loss_regression_heatmap"] = loss_reg_hmp.item() #* self.loss_heatmap_weight * 0.1
+        loss_all += loss_reg_hmp * self.loss_heatmap_weight
 
         # compute heatmap loss
         loss_heatmap = self.loss_heatmap(
@@ -877,13 +865,13 @@ class TransFusionHeadAnchorMatching(nn.Module):
         assert len(self.known_class_names) == len(self.known_class_idx), "bad known idx"
 
         bbox_targets_dim = bbox_targets.detach().clone().reshape(-1, 10)[:, 3:6]
-        bbox_targets_dim = bbox_targets_dim[pos_labels_mask]
+        bbox_targets_dim = bbox_targets_dim[pos_labels_mask].exp()
         flat_bbox_targets = bbox_targets.detach().clone().reshape(-1, 10)
 
         total_matches = ((labels < self.num_classes) * 1.0).sum()
 
         # no loss on unknowns
-        # label_weights[labels == self.num_classes] = 0.1
+        label_weights[labels == self.num_classes] = 0.1
 
         for known_idx, cls_name in zip(self.known_class_idx, self.known_class_names):
             cls_pos_labels_mask = pos_labels == known_idx
@@ -899,12 +887,12 @@ class TransFusionHeadAnchorMatching(nn.Module):
             loss_dict[f"{cls_name}_scale_factor"] = (total_matches - num_matches) / total_matches
 
             # scale bbox weights
-            # bbox_weights[labels_orig == known_idx, :] *= (total_matches - num_matches) / total_matches
-            # label_weights[labels == known_idx] *= (total_matches - num_matches) / total_matches
+            bbox_weights[labels_orig == known_idx, :] *= (total_matches - num_matches) / total_matches
+            label_weights[labels == known_idx] *= (total_matches - num_matches) / total_matches
 
-            # for i, dim_name in enumerate(['length', 'width', 'height']):
-                # values = bbox_targets_dim[cls_pos_labels_mask, i].exp()
-                # loss_dict[f"{cls_name}_mean_{dim_name}"] = values.mean()
+            for i, dim_name in enumerate(['length', 'width', 'height']):
+                values = bbox_targets_dim[cls_pos_labels_mask, i]
+                loss_dict[f"{cls_name}_mean_{dim_name}"] = values.mean()
                 # loss_dict[f"{cls_name}_var_{dim_name}"] = values.var()
 
         cls_argmax = torch.argmax(cls_score_sigmoid, dim=-1)
@@ -922,30 +910,49 @@ class TransFusionHeadAnchorMatching(nn.Module):
             loss_dict[f"{cls_name}_matched_w_other_max_confs"] = matched_cls_score_sigmoid[:, unknown_idx].max()
             # loss_dict[f"{cls_name}_pred_width"] = unk_args.mean()
 
+
+            # targets for unknowns
+            if num_matches > 0:
+                label_weights[unk_preds] = 0.0 # no class loss for unknowns
+                bbox_weights[unk_preds_full, :] = 0.0 
+                bbox_weights[unk_preds_full][..., 3:6] = 1.0 # only dim loss (don't know other params)
+                bbox_targets[unk_preds_full][..., 3:6] = self.anchors[unknown_idx] 
+                # labels[unk_preds] = unknown_idx
+                # one_hot_targets[unk_preds] = self.iou_sim[unknown_idx]
+                # print('one_hot_targets', one_hot_targets.shape)
+
         sep_heatmap_embs = pred_dicts["sep_heatmap_embs"].permute(0, 2, 1).reshape(-1, self.text_dim)
 
-        # regression should align with predicted class
-        # bbox_preds = pred_dicts['dim'].clone().permute(0, 2, 1).reshape(-1, 3)
 
+        # log the average normed logits
+        # with torch.no_grad():
+        #     sep_heatmap_embs_per_dim = sep_heatmap_embs.detach().clone()
+        #     pos_values = sep_heatmap_embs_per_dim[labels < self.num_classes].reshape(-1, 3, self.anchor_size_bins).permute(0, 2, 1).reshape(-1, 3)
+        #     neg_values = sep_heatmap_embs_per_dim[labels == self.num_classes].reshape(-1, 3, self.anchor_size_bins).permute(0, 2, 1).reshape(-1, 3)
+        #     for i, dim_name in enumerate(['length', 'width', 'height']):
+        #         loss_dict[f"{dim_name}_pos_ave_sim"] = pos_values[:, i].mean()
+        #         loss_dict[f"{dim_name}_neg_ave_sim"] = neg_values[:, i].mean()
+
+        
+        # regression should align with predicted class
+        bbox_preds = pred_dicts['dim'].clone().permute(0, 2, 1).reshape(-1, 3)
+
+        bbox_preds_as_targets = self.soft_relu_bin_vectors(bbox_preds)
         positive_anchors = self.soft_relu_bin_vectors(bbox_targets_dim)
 
-        bbox_alignment_loss = 0
-        preds_alignment_loss = 0
-        cos_embedding_loss = 0
+        bbox_alignment_loss = F.cosine_embedding_loss(sep_heatmap_embs[labels < self.num_classes], bbox_preds_as_targets[labels < self.num_classes], target=torch.ones(positive_anchors.shape[0], device=cls_score.device, dtype=torch.long))
+        loss_dict["bbox_alignment_loss"] = bbox_alignment_loss.item()
 
-        pos_sep_heatmap_embs = sep_heatmap_embs[pos_labels_mask]
-        N = pos_sep_heatmap_embs.shape[0]
+        preds_alignment_loss = F.cosine_embedding_loss(bbox_preds_as_targets[labels < self.num_classes], positive_anchors, target=torch.ones(positive_anchors.shape[0], device=cls_score.device, dtype=torch.long))
+        loss_dict["preds_alignment_loss"] = preds_alignment_loss.item()
 
-        diag_weights = torch.ones((N, N), device='cuda') * (1.0 - torch.eye(N, device='cuda'))
-        label_weights = 1.0 * torch.eye(N, device='cuda') + (1.0 / N) * diag_weights
-        dense_labels = 2 * torch.eye(N, device='cuda') - torch.ones((N, N), device='cuda') # -1 with diagonal 1
+        cos_embedding_loss = F.cosine_embedding_loss(sep_heatmap_embs[pos_labels_mask], positive_anchors, target=torch.ones(positive_anchors.shape[0], device=positive_anchors.device, dtype=torch.long))
+        # cos_embedding_loss = 0
+        loss_dict[f"loss_cos_emb"] = cos_embedding_loss
 
-        positive_anchors = positive_anchors.clone() / (1e-8 + torch.norm(positive_anchors.clone(), dim=1, keepdim=True))
-        logits = pos_sep_heatmap_embs @ positive_anchors.t() * self.logit_scale().exp() + self.logit_bias()
-        loss_sigmoid_align = - torch.sum(label_weights * F.logsigmoid(dense_labels * logits)) / N
-
-        loss_dict[f"loss_sigmoid_align"] = loss_sigmoid_align
-        loss_cls = loss_sigmoid_align
+        loss_cls = self.loss_cls(
+            cls_score, one_hot_targets, label_weights
+        ).sum() / max(num_pos, 1)
 
         preds = torch.cat([pred_dicts[head_name] for head_name in self.model_cfg.SEPARATE_HEAD_CFG.HEAD_ORDER], dim=1).permute(0, 2, 1)
         code_weights = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['code_weights']
@@ -953,7 +960,7 @@ class TransFusionHeadAnchorMatching(nn.Module):
 
         loss_bbox = self.loss_bbox(preds, bbox_targets) 
         loss_bbox_log = (loss_bbox * reg_weights).detach().clone().reshape(-1, loss_bbox.shape[-1])
-        # print("loss_bbox", loss_bbox_log.mean(dim=0))
+        print("loss_bbox", loss_bbox_log.mean(dim=0))
 
         loss_bbox = (loss_bbox * reg_weights).sum() / max(num_pos, 1)
 
