@@ -27,9 +27,9 @@ Use transfusion_lidar.yaml config for testing, need the normal class names so th
 ### NuScenes 3D Object Detection - 6 Class Known / 4 Unknown Classes
 
 
-| Method | VLM  | mAP   | NDS   | AP_B  | AP_N  | AR_N  | Download |
-|--------|------|-------|-------|-------|-------|-------|----------|
-| Ours   | OWL  | 42.52 | 45.13 | 53.09 | 26.66 | 60.10 |[model 94mb](https://drive.google.com/file/d/19whuGiz2rglDMyHm1e9VPV2OxiaeXFDn/view?usp=drive_link)|
+| Method | Arch        | VLM  | mAP   | NDS   | AP_B  | AP_N  | AR_N  | Download |
+|--------|-------------|------|-------|-------|-------|-------|-------|----------|
+| Ours   | Transfusion | GLIP  | 44.95 | 47.87 | 52.48 | 33.65 | 58.46 |[model 94mb](https://drive.google.com/file/d/19whuGiz2rglDMyHm1e9VPV2OxiaeXFDn/view?usp=drive_link)|
 
 
 ### NuScenes 3D Object Detection - 3 Class Known / 7 Unknown Classes
