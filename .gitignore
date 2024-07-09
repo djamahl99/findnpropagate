@@ -15,3 +15,7 @@ venv/
 *.bin
 output
 version.py
+*.log
+*.json
+tools/paper_scripts
+tools/images/

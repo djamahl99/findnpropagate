@@ -5,8 +5,122 @@ import tqdm
 import time
 import glob
 from torch.nn.utils import clip_grad_norm_
+from pcdet.models import load_data_to_gpu
+from pcdet.models.dense_heads.glip_box_classification import GLIPBoxClassification
+from pcdet.ops.iou3d_nms import iou3d_nms_utils
 from pcdet.utils import common_utils, commu_utils
+# from pcdet.models.dense_heads.pseudo_processor import PseudoProcessor 
+from pcdet.models.dense_heads import PseudoProcessor, CLIPBoxClassification, CLIPBoxClassificationMaskCLIP
+from pathlib import Path
 
+def pseudo_labels_exist(cfg, epoch:int=0, expected_size:int=0):
+    """Used to check pseudolabels when they are expected to be there
+    """
+
+    print('pseudo_labels_exist', cfg, epoch, expected_size)
+    st_folder = Path(cfg.MODEL.DENSE_HEAD.SELF_TRAIN_PATH)
+
+    assert st_folder.exists(), f'self-training folder should already exist! epoch={epoch}'
+
+    pseudo_list = glob.glob(str(st_folder / '*.pth'))
+
+    if len(pseudo_list) < expected_size:
+        return False
+    
+    sd = torch.load(pseudo_list[0], map_location='cpu')
+    assert 'epoch' in sd, 'epoch should have been saved to state_dict!'
+
+    # check if the first pseudo is from this epoch
+    return sd['epoch'] == epoch
+
+def extract_pseudo_labels(model: torch.nn.Module, dataloader, cfg, logger=None, epoch:int = 0):
+    dataset = dataloader.dataset
+
+    # create pseudoprocessor
+
+    pseudo_processor = PseudoProcessor(cfg.CLASS_NAMES, self_training_folder=cfg.MODEL.DENSE_HEAD.SELF_TRAIN_PATH)
+
+    logger.info('*************** EXTRACTING PSEUDOLABELS *****************')
+    model.eval()
+
+    progress_bar = tqdm.tqdm(total=len(dataloader), leave=True, desc=f'Extracting pseudos {epoch}', dynamic_ncols=True)
+    start_time = time.time()
+
+    use_clip = cfg.OPTIMIZATION.get('CLIP_UNK_RELABEL', False)
+    unk_iou_thresh = cfg.OPTIMIZATION.get('UNK_IOU_THRESH', 0.1)
+    st_conf_thresh = cfg.OPTIMIZATION.get('ST_CONF_THRESH', 0.1)
+    clip_type = cfg.OPTIMIZATION.get('CLIP_TYPE', 'CROP')
+    
+
+    pred_keys = ['pred_boxes', 'pred_scores', 'pred_labels']
+
+    if use_clip:
+        device = [p.device for p in model.parameters()][0]
+        if clip_type == 'CROP':
+            clip = CLIPBoxClassification().to(device)
+        elif clip_type == 'MASKCLIP':
+            clip = CLIPBoxClassificationMaskCLIP().to(device)
+        elif clip_type == 'GLIP':
+            clip = GLIPBoxClassification(all_class_names=pseudo_processor.all_class_names).to(device)
+
+        print('CLIP', clip, clip._get_name())
+
+    for i, batch_dict in enumerate(dataloader):
+        load_data_to_gpu(batch_dict)
+
+        with torch.no_grad():
+            pred_dicts, ret_dict = model(batch_dict)
+
+        # use clip for reclassification of objects that do not align with knowns
+        if use_clip:
+            unk_dicts = []
+            knw_dicts = []
+
+            num_dicts = []
+            for b, pred_dict in enumerate(pred_dicts):
+                pred_boxes = pred_dict['pred_boxes'][:, :7]
+                gt_boxes = batch_dict['gt_boxes'][b][:, :7]
+                
+                ious = iou3d_nms_utils.boxes_iou3d_gpu(pred_boxes, gt_boxes)
+                ious = ious.max(dim=1).values
+
+                scores = pred_dict['pred_scores']
+                unk_mask = (ious < unk_iou_thresh) & (scores >= st_conf_thresh)
+                knw_mask = (ious >= unk_iou_thresh) & (scores >= st_conf_thresh)
+
+                unk_dict = {k: pred_dict[k][unk_mask] for k in pred_keys}
+                knw_dict = {k: pred_dict[k][knw_mask] for k in pred_keys} 
+
+                unk_dicts.append(unk_dict)
+                knw_dicts.append(knw_dict)
+
+            unk_dicts = clip(batch_dict, unk_dicts)            
+
+            comb_dicts = []
+            for b in range(batch_dict['batch_size']):
+                # reject proposals that clip says are knowns, as we have removed any that overlap with knowns
+                unk_labels = unk_dicts[b]['pred_labels'].reshape(-1)
+                unk_mask = torch.ones_like(unk_labels, dtype=torch.bool)
+                for i in range(len(unk_labels)):
+                    unk_mask[i] = unk_labels[i].item() in pseudo_processor.unknown_labels
+                        
+                # print('removed', (len(unk_mask) - unk_mask.sum().item()), 'clip knowns', len(unk_mask))
+
+                comb_dict = {k: torch.cat((knw_dicts[b][k], unk_dicts[b][k][unk_mask].to(knw_dicts[b][k].device)), dim=0) for k in pred_keys}
+                comb_dicts.append(comb_dict)
+            
+            pred_dicts = comb_dicts
+
+                # num_dicts.append(dict(known=(~unk_mask).sum().item(), unknown=unk_mask.sum().item()))
+
+        pseudo_processor.save_predictions(batch_dict, pred_dicts, epoch)
+
+        disp_dict = {}
+        progress_bar.update()
+
+    progress_bar.close()
+    
+    model.train()
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False, 
@@ -175,6 +289,85 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 cur_scheduler = lr_warmup_scheduler
             else:
                 cur_scheduler = lr_scheduler
+            
+            augment_disable_flag = disable_augmentation_hook(hook_config, dataloader_iter, total_epochs, cur_epoch, cfg, augment_disable_flag, logger)
+            accumulated_iter = train_one_epoch(
+                model, optimizer, train_loader, model_func,
+                lr_scheduler=cur_scheduler,
+                accumulated_iter=accumulated_iter, optim_cfg=optim_cfg,
+                rank=rank, tbar=tbar, tb_log=tb_log,
+                leave_pbar=(cur_epoch + 1 == total_epochs),
+                total_it_each_epoch=total_it_each_epoch,
+                dataloader_iter=dataloader_iter, 
+                
+                cur_epoch=cur_epoch, total_epochs=total_epochs,
+                use_logger_to_record=use_logger_to_record, 
+                logger=logger, logger_iter_interval=logger_iter_interval,
+                ckpt_save_dir=ckpt_save_dir, ckpt_save_time_interval=ckpt_save_time_interval, 
+                show_gpu_stat=show_gpu_stat,
+                use_amp=use_amp
+            )
+
+            # save trained model
+            trained_epoch = cur_epoch + 1
+            if trained_epoch % ckpt_save_interval == 0 and rank == 0:
+
+                ckpt_list = glob.glob(str(ckpt_save_dir / 'checkpoint_epoch_*.pth'))
+                ckpt_list.sort(key=os.path.getmtime)
+
+                if ckpt_list.__len__() >= max_ckpt_save_num:
+                    for cur_file_idx in range(0, len(ckpt_list) - max_ckpt_save_num + 1):
+                        os.remove(ckpt_list[cur_file_idx])
+
+                ckpt_name = ckpt_save_dir / ('checkpoint_epoch_%d' % trained_epoch)
+                save_checkpoint(
+                    checkpoint_state(model, optimizer, trained_epoch, accumulated_iter), filename=ckpt_name,
+                )
+
+def train_model_st(model, optimizer, train_loader, model_func, lr_scheduler, optim_cfg,
+                start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
+                lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
+                merge_all_iters_to_one_epoch=False, use_amp=False,
+                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, cfg=None, inf_loader=None):
+    accumulated_iter = start_iter
+
+    # use for disable data augmentation hook
+    hook_config = cfg.get('HOOK', None) 
+    augment_disable_flag = False
+
+    st_warmup_epochs = cfg.OPTIMIZATION.get('ST_WARMUP', 1)
+    st_interval = cfg.OPTIMIZATION.get('ST_INTERVAL', 1)
+
+    # 
+    assert inf_loader is not None, 'need inference loader for self-training!'
+
+    with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
+        total_it_each_epoch = len(train_loader)
+        if merge_all_iters_to_one_epoch:
+            assert hasattr(train_loader.dataset, 'merge_all_iters_to_one_epoch')
+            train_loader.dataset.merge_all_iters_to_one_epoch(merge=True, epochs=total_epochs)
+            total_it_each_epoch = len(train_loader) // max(total_epochs, 1)
+
+        dataloader_iter = iter(train_loader)
+        for cur_epoch in tbar:
+            print('cur epoch', cur_epoch, 'start_epoch', start_epoch)
+            calc_epoch = cur_epoch + start_epoch
+            print('calc_epoch', calc_epoch)
+            if train_sampler is not None:
+                train_sampler.set_epoch(cur_epoch)
+
+            # train one epoch
+            if lr_warmup_scheduler is not None and cur_epoch < optim_cfg.WARMUP_EPOCH:
+                cur_scheduler = lr_warmup_scheduler
+            else:
+                cur_scheduler = lr_scheduler
+
+            # run inference (after last epoch) -> check that pseudo labels have not been generated for the past epoch
+            if calc_epoch >= st_warmup_epochs and ((calc_epoch - st_warmup_epochs) % st_interval == 0 or calc_epoch == st_warmup_epochs):
+                pseudos_exist = pseudo_labels_exist(cfg, int(calc_epoch - 1), expected_size=len(inf_loader))
+
+                if not pseudos_exist:
+                    extract_pseudo_labels(model, inf_loader, cfg, logger=logger, epoch=int(calc_epoch - 1))
             
             augment_disable_flag = disable_augmentation_hook(hook_config, dataloader_iter, total_epochs, cur_epoch, cfg, augment_disable_flag, logger)
             accumulated_iter = train_one_epoch(

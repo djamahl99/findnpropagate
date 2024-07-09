@@ -180,7 +180,7 @@ class DepthLSSTransform(nn.Module):
             batch_dict:
                 spatial_features_img (tensor): bev features from image modality
         """
-        x = batch_dict['image_fpn'] 
+        x = batch_dict['image_fpn']
         x = x[0]
         BN, C, H, W = x.size()
         img = x.view(int(BN/6), 6, C, H, W)

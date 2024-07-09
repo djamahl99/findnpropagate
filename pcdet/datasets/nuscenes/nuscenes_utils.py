@@ -546,7 +546,7 @@ def transform_det_annos_to_nusc_annos(det_annos, nusc):
                 'rotation': box.orientation.elements.tolist(),
                 'velocity': box.velocity[:2].tolist(),
                 'detection_name': name,
-                'detection_score': box.score,
+                'detection_score': float(box.score),
                 'attribute_name': attr
             }
             annos.append(nusc_anno)

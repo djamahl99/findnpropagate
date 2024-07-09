@@ -46,6 +46,42 @@ def random_flip_along_y(gt_boxes, points, return_flip=False, enable=None):
         return gt_boxes, points, enable
     return gt_boxes, points
 
+def pseudo_random_flip_along_x(pseudo_boxes, enable=None):
+    """
+    Args:
+        gt_boxes: (N, 7 + C), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
+        points: (M, 3 + C)
+    Returns:
+    """
+    if enable:
+        pseudo_boxes[:, 1] = -pseudo_boxes[:, 1]
+        pseudo_boxes[:, 6] = -pseudo_boxes[:, 6]
+
+    return pseudo_boxes
+
+def pseudo_random_flip_along_y(pseudo_boxes, enable=None):
+    """
+    Args:
+        gt_boxes: (N, 7 + C), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
+        points: (M, 3 + C)
+    Returns:
+    """
+    if enable:
+        pseudo_boxes[:, 0] = -pseudo_boxes[:, 0]
+        pseudo_boxes[:, 6] = -(pseudo_boxes[:, 6] + np.pi)
+
+    return pseudo_boxes
+
+def pseudo_global_rotation(pseudo_boxes, noise_rotation):
+    """
+    Args:
+        gt_boxes: (N, 7 + C), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
+    Returns:
+    """
+    pseudo_boxes[:, 0:3] = common_utils.rotate_points_along_z(pseudo_boxes[np.newaxis, :, 0:3], np.array([noise_rotation]))[0]
+    pseudo_boxes[:, 6] += noise_rotation
+
+    return pseudo_boxes
 
 def global_rotation(gt_boxes, points, rot_range, return_rot=False, noise_rotation=None):
     """
@@ -109,6 +145,17 @@ def global_scaling_with_roi_boxes(gt_boxes, roi_boxes, points, scale_range, retu
         return gt_boxes,roi_boxes, points, noise_scale
     return gt_boxes, roi_boxes, points
 
+def pseudo_global_scaling(pseudo_boxes, noise_scale):
+    """
+    Args:
+        gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading]
+        noise_scale: float
+    Returns:
+    """
+    pseudo_boxes[:, :3] *= noise_scale
+    pseudo_boxes[:, :6] *= noise_scale
+
+    return pseudo_boxes
 
 def random_image_flip_horizontal(image, depth_map, gt_boxes, calib):
     """

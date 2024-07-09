@@ -6,6 +6,9 @@ from torch.nn.init import kaiming_normal_
 from ..model_utils import model_nms_utils
 from ..model_utils import centernet_utils
 from ...utils import loss_utils
+from functools import partial
+
+from pcdet.models.dense_heads.pseudo_processor import PseudoProcessor
 
 
 class SeparateHead(nn.Module):
@@ -49,6 +52,19 @@ class CenterHead(nn.Module):
     def __init__(self, model_cfg, input_channels, num_class, class_names, grid_size, point_cloud_range, voxel_size,
                  predict_boxes_when_training=True):
         super().__init__()
+
+        self.use_pseudo = model_cfg.get('USE_PSEUDO', False)
+
+        if self.use_pseudo:
+            self.pseudo_processor = PseudoProcessor(class_names, self_training_folder=model_cfg.SELF_TRAIN_PATH)
+            num_class = self.pseudo_processor.num_classes # uses all classes to calculate
+            # have to override so class names per head does not remove unknowns
+            class_names = self.pseudo_processor.all_class_names
+            self.class_names = self.pseudo_processor.all_class_names
+
+
+        self.pseudo_nms_thresh = model_cfg.get('PSEUDO_NMS_THRESH', None)
+
         self.model_cfg = model_cfg
         self.num_class = num_class
         self.grid_size = grid_size
@@ -81,7 +97,19 @@ class CenterHead(nn.Module):
 
         self.heads_list = nn.ModuleList()
         self.separate_head_cfg = self.model_cfg.SEPARATE_HEAD_CFG
+        self.heads_hm_weights = []
+        unk_cls_weight = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS.get('unk_cls_weight', 1.0)
+        self.unk_cls_weight = unk_cls_weight
+
         for idx, cur_class_names in enumerate(self.class_names_each_head):
+            if self.use_pseudo:
+                cur_class_weights = [1.0 if cls_name in self.pseudo_processor.known_class_names else unk_cls_weight for cls_name in cur_class_names]
+            else:
+                cur_class_weights = [1.0 for cls_name in cur_class_names]
+
+            print('cur_class_names,weights', zip(cur_class_names, cur_class_weights))
+            self.heads_hm_weights.append(cur_class_weights)
+
             cur_head_dict = copy.deepcopy(self.separate_head_cfg.HEAD_DICT)
             cur_head_dict['hm'] = dict(out_channels=len(cur_class_names), num_conv=self.model_cfg.NUM_HM_CONV)
             self.heads_list.append(
@@ -94,10 +122,31 @@ class CenterHead(nn.Module):
             )
         self.predict_boxes_when_training = predict_boxes_when_training
         self.forward_ret_dict = {}
-        self.build_losses()
+        self.build_losses(self.model_cfg.LOSS_CONFIG)
 
-    def build_losses(self):
-        self.add_module('hm_loss_func', loss_utils.FocalLossCenterNet())
+    def build_losses(self, loss_cfg: dict):
+        loss_cls = self.model_cfg.LOSS_CONFIG.get('LOSS_CLS', dict())
+
+        print('loss_cls', loss_cls)
+        use_gfl = loss_cls.get('use_gfl', False)
+        self.hm_loss_reduc = None
+
+        if use_gfl:
+            alpha = loss_cls.get('alpha', 2.0)
+            gamma = loss_cls.get('gamma', 4.0)
+            print('use_gfl!')
+            self.add_module('hm_loss_func', loss_utils.GaussianFocalLoss(alpha=alpha, gamma=gamma))
+            self.hm_loss_reduc = 'gfl'
+
+            if loss_cls.get('st_norm', False):
+                print('use stnorm!')
+                self.hm_loss_reduc = 'norm'
+                self.loss_ema_known = [0.0 for i in range(len(self.class_names_each_head))]
+                self.loss_ema_unk = [0.0 for i in range(len(self.class_names_each_head))]
+                self.loss_ema_mom = 0.9997
+
+        else:
+            self.add_module('hm_loss_func', loss_utils.FocalLossCenterNet())
         self.add_module('reg_loss_func', loss_utils.RegLossCenterNet())
 
     def assign_target_of_single_head(
@@ -132,6 +181,9 @@ class CenterHead(nn.Module):
 
         radius = centernet_utils.gaussian_radius(dx, dy, min_overlap=gaussian_overlap)
         radius = torch.clamp_min(radius.int(), min=min_radius)
+
+        max_radius = int(max(feature_map_size) // 2)
+        radius = torch.clamp_max(radius.int(), max=max_radius)
 
         for k in range(min(num_max_objs, gt_boxes.shape[0])):
             if dx[k] <= 0 or dy[k] <= 0:
@@ -176,12 +228,18 @@ class CenterHead(nn.Module):
             'target_boxes': [],
             'inds': [],
             'masks': [],
-            'heatmap_masks': []
+            'heatmap_masks': [],
+            'unk_nums': []
         }
+
+        if self.use_pseudo:
+            unk_num_list = [0 for _ in self.class_names_each_head]
 
         all_names = np.array(['bg', *self.class_names])
         for idx, cur_class_names in enumerate(self.class_names_each_head):
+            hidx = idx
             heatmap_list, target_boxes_list, inds_list, masks_list = [], [], [], []
+
             for bs_idx in range(batch_size):
                 cur_gt_boxes = gt_boxes[bs_idx]
                 gt_class_names = all_names[cur_gt_boxes[:, -1].cpu().long().numpy()]
@@ -194,6 +252,11 @@ class CenterHead(nn.Module):
                     temp_box = cur_gt_boxes[idx]
                     temp_box[-1] = cur_class_names.index(name) + 1
                     gt_boxes_single_head.append(temp_box[None, :])
+
+                    if self.use_pseudo and name not in self.pseudo_processor.known_class_names:
+                        unk_num_list[hidx] += 1
+                        # unk_mask_single_head.append(name not in self.pseudo_processor.known_class_names)
+                    
 
                 if len(gt_boxes_single_head) == 0:
                     gt_boxes_single_head = cur_gt_boxes[:0, :]
@@ -216,6 +279,9 @@ class CenterHead(nn.Module):
             ret_dict['target_boxes'].append(torch.stack(target_boxes_list, dim=0))
             ret_dict['inds'].append(torch.stack(inds_list, dim=0))
             ret_dict['masks'].append(torch.stack(masks_list, dim=0))
+
+            if self.use_pseudo:
+                ret_dict['unk_nums'] = unk_num_list
         return ret_dict
 
     def sigmoid(self, x):
@@ -230,12 +296,67 @@ class CenterHead(nn.Module):
         loss = 0
 
         for idx, pred_dict in enumerate(pred_dicts):
+            target_boxes = target_dicts['target_boxes'][idx]
+
+            unk_num = 0
+            if self.use_pseudo:
+                unk_num = target_dicts['unk_nums'][idx]
+                # unk_num = unk_masks.sum()
+
+            pred_boxes = torch.cat([pred_dict[head_name] for head_name in self.separate_head_cfg.HEAD_ORDER], dim=1)
+
             pred_dict['hm'] = self.sigmoid(pred_dict['hm'])
             hm_loss = self.hm_loss_func(pred_dict['hm'], target_dicts['heatmaps'][idx])
+
+            if self.hm_loss_reduc == 'gfl':
+                # need to do reduction
+
+                cur_cls_weights = self.heads_hm_weights[idx]
+                cur_cls_weights = hm_loss.new_tensor(cur_cls_weights).reshape(-1, 1, 1)
+
+                # apply class weights
+                hm_loss = hm_loss * cur_cls_weights
+
+                eq1 = target_dicts['heatmaps'][idx].eq(1).float().sum().item()
+                hm_loss = hm_loss.sum() / max(eq1, 1)
+
+            if self.hm_loss_reduc == 'norm':
+                # need to do reduction
+                known_idx = [i for i, cls_name in enumerate(self.class_names_each_head[idx]) if cls_name in self.pseudo_processor.known_class_names]
+                unk_idx = [i for i, cls_name in enumerate(self.class_names_each_head[idx]) if i not in known_idx]
+
+                eq1 = target_dicts['heatmaps'][idx].eq(1).float().sum().item()
+                knwn_num = eq1 - unk_num
+
+                # print('eq1', eq1, 'known', knwn_num, 'unk', unk_num)
+
+                unk_loss = hm_loss[:, unk_idx].sum() / max(unk_num, 1)
+                kwn_loss = hm_loss[:, known_idx].sum() / max(knwn_num, 1)
+
+                # EMA
+                self.loss_ema_known[idx] = self.loss_ema_known[idx] * self.loss_ema_mom + kwn_loss.detach().clone() * (1 - self.loss_ema_mom)
+                self.loss_ema_unk[idx] = self.loss_ema_unk[idx] * self.loss_ema_mom + unk_loss.detach().clone() * (1 - self.loss_ema_mom)
+                
+                # LOGGING
+                tb_dict[f'loss_ema_known_{idx}'] = self.loss_ema_known[idx].item()
+                tb_dict[f'loss_ema_unk_{idx}'] = self.loss_ema_unk[idx].item()
+
+                unk_coeff = self.unk_cls_weight * (self.loss_ema_known[idx]/(self.loss_ema_unk[idx] + 1e-6))
+
+                # if there are no unknowns coefficient is unreasonable
+                if len(unk_idx) == 0:
+                    unk_coeff = 0*unk_coeff + 1.0 # (make 1, keep tensor) loss should be zero anyways
+                else:
+                    # clamp to reasonable range
+                    unk_coeff = unk_coeff.clamp(min=0, max=10)
+
+
+                tb_dict[f'loss_unk_coeff_{idx}'] = unk_coeff.item()
+
+                hm_loss = (1.0 / (1.0 + self.unk_cls_weight)) * (kwn_loss + unk_coeff * unk_loss)
+
             hm_loss *= self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['cls_weight']
 
-            target_boxes = target_dicts['target_boxes'][idx]
-            pred_boxes = torch.cat([pred_dict[head_name] for head_name in self.separate_head_cfg.HEAD_ORDER], dim=1)
 
             reg_loss = self.reg_loss_func(
                 pred_boxes, target_dicts['masks'][idx], target_dicts['inds'][idx], target_boxes
@@ -246,6 +367,17 @@ class CenterHead(nn.Module):
             loss += hm_loss + loc_loss
             tb_dict['hm_loss_head_%d' % idx] = hm_loss.item()
             tb_dict['loc_loss_head_%d' % idx] = loc_loss.item()
+
+
+        # pseudo infos
+        if self.use_pseudo:
+            for k, v in self.pseudo_processor.forward_pseudo_stats.items():
+                tb_dict[k] = v
+
+        # if self.hm_loss_reduc == 'norm':
+        #     for head in range(len(pred_dicts)):
+        #         tb_dict[f'loss_ema_known_{head}'] = self.loss_ema_known[head].item()
+        #         tb_dict[f'loss_ema_unk_{head}'] = self.loss_ema_unk[head].item()
 
         tb_dict['rpn_loss'] = loss.item()
         return loss, tb_dict
@@ -322,6 +454,9 @@ class CenterHead(nn.Module):
         return rois, roi_scores, roi_labels
 
     def forward(self, data_dict):
+        if self.use_pseudo and self.training:
+            data_dict = self.pseudo_processor(data_dict)
+
         spatial_features_2d = data_dict['spatial_features_2d']
         x = self.shared_conv(spatial_features_2d)
 
@@ -335,6 +470,11 @@ class CenterHead(nn.Module):
                 feature_map_stride=data_dict.get('spatial_features_2d_strides', None)
             )
             self.forward_ret_dict['target_dicts'] = target_dict
+
+            # if self.use_pseudo and self.pseudo_processor.self_training:
+            #     self.pseudo_processor.save_predictions(data_dict, self.generate_predicted_boxes(
+            #         data_dict['batch_size'], pred_dicts
+            #     ))
 
         self.forward_ret_dict['pred_dicts'] = pred_dicts
 

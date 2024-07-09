@@ -8,6 +8,7 @@ from ...utils import loss_utils
 from ...utils.spconv_utils import replace_feature, spconv
 import copy
 from easydict import EasyDict
+from pcdet.models.dense_heads.pseudo_processor import PseudoProcessor
 
 
 class SeparateHead(nn.Module):
@@ -58,7 +59,17 @@ class VoxelNeXtHead(nn.Module):
         self.voxel_size = torch.Tensor(voxel_size).cuda()
         self.feature_map_stride = self.model_cfg.TARGET_ASSIGNER_CONFIG.get('FEATURE_MAP_STRIDE', None)
 
+        self.use_pseudo = model_cfg.get('USE_PSEUDO', False)
         self.class_names = class_names
+
+        if self.use_pseudo:
+            self.pseudo_processor = PseudoProcessor(class_names, self_training_folder=model_cfg.SELF_TRAIN_PATH)
+            num_class = self.pseudo_processor.num_classes # uses all classes to calculate
+            # have to override so class names per head does not remove unknowns
+            class_names = self.pseudo_processor.all_class_names
+            self.class_names = self.pseudo_processor.all_class_names
+        self.pseudo_nms_thresh = model_cfg.get('PSEUDO_NMS_THRESH', None)
+
         self.class_names_each_head = []
         self.class_id_mapping_each_head = []
         self.gaussian_ratio = self.model_cfg.get('GAUSSIAN_RATIO', 1)
@@ -521,6 +532,9 @@ class VoxelNeXtHead(nn.Module):
         return spatial_shape, batch_index, voxel_indices, spatial_indices, num_voxels
 
     def forward(self, data_dict):
+        if self.use_pseudo and self.training:
+            data_dict = self.pseudo_processor(data_dict)
+
         x = data_dict['encoded_spconv_tensor']
 
         spatial_shape, batch_index, voxel_indices, spatial_indices, num_voxels = self._get_voxel_infos(x)
@@ -535,6 +549,12 @@ class VoxelNeXtHead(nn.Module):
                 data_dict['gt_boxes'], num_voxels, spatial_indices, spatial_shape
             )
             self.forward_ret_dict['target_dicts'] = target_dict
+
+            # if self.use_pseudo and self.pseudo_processor.self_training:
+            #     self.pseudo_processor.save_predictions(data_dict, self.generate_predicted_boxes(
+            #             data_dict['batch_size'], 
+            #             pred_dicts, voxel_indices, spatial_shape
+            #         ))
 
         self.forward_ret_dict['pred_dicts'] = pred_dicts
         self.forward_ret_dict['voxel_indices'] = voxel_indices

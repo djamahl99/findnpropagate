@@ -5,6 +5,7 @@ from skimage import transform
 import torch
 import torchvision
 from ...utils import box_utils, common_utils
+from pcdet.datasets.augmentor import augmentor_utils
 
 tv = None
 try:
@@ -101,6 +102,127 @@ class DataProcessor(object):
             shuffle_idx = np.random.permutation(points.shape[0])
             points = points[shuffle_idx]
             data_dict['points'] = points
+
+        return data_dict
+
+    def fov_points_only(self, data_dict=None, config=None):
+        if data_dict is None:
+            return partial(self.fov_points_only, config=config)
+
+        img_aug_matrix = data_dict['img_aug_matrix']
+        cur_lidar_aug_matrix = data_dict['lidar_aug_matrix']
+        lidar2image = data_dict['lidar2image']
+        
+        cam = config.get('CAMERA', None)
+
+        if cam is not None:
+            cur_coords = data_dict['points'][:, :3].copy()
+
+            cur_img_aug_matrix = img_aug_matrix[cam]
+            cur_lidar2image = lidar2image[cam]
+
+            # inverse aug
+            cur_coords -= cur_lidar_aug_matrix[:3, 3]
+
+            cur_coords = np.matmul(np.linalg.inv(cur_lidar_aug_matrix[:3, :3]), cur_coords.T)
+
+            # lidar2image
+            cur_coords = np.matmul(cur_lidar2image[:3, :3], cur_coords)
+            cur_coords += cur_lidar2image[:3, 3].reshape(3, 1)
+            # get 2d coords
+            cur_coords[2, :] = np.clip(cur_coords[2, :].copy(), 1e-5, 1e5)
+            cur_coords[:2, :] /= cur_coords[2:3, :].copy()
+
+            # do image aug
+            cur_coords = np.matmul(cur_img_aug_matrix[:3, :3], cur_coords)
+            cur_coords += cur_img_aug_matrix[:3, 3].reshape(3, 1)
+            cur_coords = cur_coords[:2, :].T
+
+            # normalize coords for grid sample
+            cur_coords = cur_coords[..., [1, 0]]
+
+            on_img = (
+                (cur_coords[..., 1] < 1600)
+                & (cur_coords[..., 1] >= 0)
+                & (cur_coords[..., 0] < 900)
+                & (cur_coords[..., 0] >= 0)
+            )
+
+            print('on_img', on_img.sum(), on_img.shape)
+
+            data_dict['points'] = data_dict['points'][on_img]
+
+            # print('on_img', on_img.sum(), on_img.shape)
+
+            # print('cur_coords', cur_coords.shape)
+            # print('cur_coords', cur_coords[..., 0].min(), cur_coords[..., 0].max(), cur_coords[..., 1].min(), cur_coords[..., 1].max())
+
+        return data_dict
+
+    # def ground_removal(self, data_dict=None, config=None):
+    #     if data_dict is None:
+    #         return partial(self.ground_removal, config=config)
+
+    #     # do ransac
+    #     from sklearn.linear_model import RANSACRegressor
+
+    #     points = data_dict['points']
+    #     # ground_mask = fit_plane(points[:, :3])
+
+    #     reg = RANSACRegressor().fit(points[:, [0, 2]], points[:, 1])
+
+
+    #     print('inliers', ground_mask.sum(), 'all', ground_mask.shape)
+        
+    #     points = points[~ground_mask]
+
+    #     data_dict['points'] = points
+
+    #     return data_dict
+
+    def translate_points(self, data_dict=None, config=None):
+        if data_dict is None:
+            return partial(self.translate_points, config=config)
+
+        rotation = config.get('ROTATION', False)
+        if rotation:
+            # noise_rot = np.pi/2
+            # rot_range = None
+            # gt_boxes, points, noise_rot = augmentor_utils.global_rotation(
+            #     data_dict['gt_boxes'], data_dict['points'], noise_rotation=noise_rot, return_rot=True, rot_range=rot_range
+            # )
+            # if 'roi_boxes' in data_dict.keys():
+            #     num_frame, num_rois,dim = data_dict['roi_boxes'].shape
+            #     roi_boxes, _, _ = augmentor_utils.global_rotation(
+            #     data_dict['roi_boxes'].reshape(-1, dim), np.zeros([1, 3]), rot_range=rot_range, return_rot=True, noise_rotation=noise_rot)
+            #     data_dict['roi_boxes'] = roi_boxes.reshape(num_frame, num_rois,dim)
+
+            # if 'pseudo_boxes' in data_dict.keys():
+            #     pseudo_boxes = augmentor_utils.pseudo_global_rotation(data_dict['pseudo_boxes'], noise_rotation=noise_rot)
+            #     data_dict['pseudo_boxes'] = pseudo_boxes
+
+            # data_dict['gt_boxes'] = gt_boxes
+            # data_dict['points'] = points
+            # data_dict['noise_rot'] = noise_rot
+
+            from pyquaternion import Quaternion
+            kitti_to_nu_lidar = Quaternion(axis=(0, 0, 1), angle=np.pi / 2)
+            kitti_to_nu_lidar_inv = kitti_to_nu_lidar.inverse
+
+            if rotation == 'forward':
+                data_dict['points'][:, :3] = data_dict['points'][:, :3] @ kitti_to_nu_lidar_inv.rotation_matrix
+            elif rotation == 'backward':
+                data_dict['points'][:, :3] = data_dict['points'][:, :3] @ kitti_to_nu_lidar.rotation_matrix
+
+
+        if config.get('TRANSLATION', False):
+            translation = np.array(config.get('TRANSLATION', False)).reshape(1, 3)
+            # points = common_utils.rotate_points_along_z()
+
+            # print('translation!', translation)
+
+            
+            data_dict['points'][..., :3] = data_dict['points'][..., :3] + translation
 
         return data_dict
 

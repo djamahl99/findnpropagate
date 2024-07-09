@@ -20,6 +20,7 @@ class DatasetTemplate(torch_data.Dataset):
         self.logger = logger
         self.root_path = root_path if root_path is not None else Path(self.dataset_cfg.DATA_PATH)
         self.logger = logger
+        self.skip_no_gt = self.dataset_cfg.get('SKIP_NO_GT', True)
         if self.dataset_cfg is None or class_names is None:
             return
 
@@ -209,7 +210,7 @@ class DatasetTemplate(torch_data.Dataset):
             data_dict=data_dict
         )
 
-        if self.training and len(data_dict['gt_boxes']) == 0:
+        if self.training and len(data_dict['gt_boxes']) == 0 and self.skip_no_gt:
             new_index = np.random.randint(self.__len__())
             return self.__getitem__(new_index)
 
@@ -248,7 +249,18 @@ class DatasetTemplate(torch_data.Dataset):
                     for k in range(batch_size):
                         batch_gt_boxes3d[k, :val[k].__len__(), :] = val[k]
                     ret[key] = batch_gt_boxes3d
-
+                elif key in ['pseudo_boxes']: # same processing as GT, separately so we can do different losses for different models
+                    max_gt = max([len(x) for x in val])
+                    batch_gt_boxes3d = np.zeros((batch_size, max_gt, val[0].shape[-1]), dtype=np.float32)
+                    for k in range(batch_size):
+                        batch_gt_boxes3d[k, :val[k].__len__(), :] = val[k]
+                    ret[key] = batch_gt_boxes3d
+                elif key in ['pseudo_samples_mask']:
+                    max_pseudos = max([len(x) for x in val])
+                    batch_sample_mask = np.zeros((batch_size, max_pseudos), dtype=bool)
+                    for k in range(batch_size):
+                        batch_sample_mask[k, :val[k].__len__()] = val[k]
+                    ret[key] = batch_sample_mask
                 elif key in ['roi_boxes']:
                     max_gt = max([x.shape[1] for x in val])
                     batch_gt_boxes3d = np.zeros((batch_size, val[0].shape[0], max_gt, val[0].shape[-1]), dtype=np.float32)
@@ -315,10 +327,17 @@ class DatasetTemplate(torch_data.Dataset):
                     ret[key] = np.stack(points, axis=0)
                 elif key in ['camera_imgs']:
                     ret[key] = torch.stack([torch.stack(imgs,dim=0) for imgs in val],dim=0)
+                elif key in ['img_process_infos']:
+                    r = []
+                    for x in val:
+                        r.extend(x)
+                    ret[key] = r
                 else:
                     ret[key] = np.stack(val, axis=0)
-            except:
+            except Exception as e:
+                print("exception", e)
                 print('Error in collate_batch: key=%s' % key)
+                print(val)
                 raise TypeError
 
         ret['batch_size'] = batch_size * batch_size_ratio

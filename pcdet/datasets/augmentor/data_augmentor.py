@@ -5,9 +5,12 @@ from PIL import Image
 
 from ...utils import common_utils
 from . import augmentor_utils, database_sampler
+from .pseudo_loader import PseudoLoader
 
 
 class DataAugmentor(object):
+    pseudo_loader: PseudoLoader
+    
     def __init__(self, root_path, augmentor_configs, class_names, logger=None):
         self.root_path = root_path
         self.class_names = class_names
@@ -70,6 +73,12 @@ class DataAugmentor(object):
                 )
                 data_dict['roi_boxes'] = roi_boxes.reshape(num_frame, num_rois,dim)
 
+            if 'pseudo_boxes' in data_dict.keys():
+                pseudo_boxes = getattr(augmentor_utils, 'pseudo_random_flip_along_%s' % cur_axis)(
+                    data_dict['pseudo_boxes'], enable=enable
+                )
+                data_dict['pseudo_boxes'] = pseudo_boxes
+
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
         return data_dict
@@ -88,6 +97,10 @@ class DataAugmentor(object):
             roi_boxes, _, _ = augmentor_utils.global_rotation(
             data_dict['roi_boxes'].reshape(-1, dim), np.zeros([1, 3]), rot_range=rot_range, return_rot=True, noise_rotation=noise_rot)
             data_dict['roi_boxes'] = roi_boxes.reshape(num_frame, num_rois,dim)
+
+        if 'pseudo_boxes' in data_dict.keys():
+            pseudo_boxes = augmentor_utils.pseudo_global_rotation(data_dict['pseudo_boxes'], noise_rotation=noise_rot)
+            data_dict['pseudo_boxes'] = pseudo_boxes
 
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
@@ -108,6 +121,13 @@ class DataAugmentor(object):
                 data_dict['gt_boxes'], data_dict['points'], config['WORLD_SCALE_RANGE'], return_scale=True
             )
 
+        if 'pseudo_boxes' in data_dict.keys():
+            pseudo_boxes = augmentor_utils.pseudo_global_scaling(
+                data_dict['pseudo_boxes'], noise_scale
+            )
+
+            data_dict['pseudo_boxes'] = pseudo_boxes
+
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
         data_dict['noise_scale'] = noise_scale
@@ -126,6 +146,8 @@ class DataAugmentor(object):
             images, depth_maps, gt_boxes = getattr(augmentor_utils, 'random_image_flip_%s' % cur_axis)(
                 images, depth_maps, gt_boxes, calib,
             )
+        
+        assert 'pseudo_boxes' not in data_dict.keys(), 'not implemented for pseudo!'            
 
         data_dict['images'] = images
         data_dict['depth_maps'] = depth_maps
@@ -146,6 +168,9 @@ class DataAugmentor(object):
         gt_boxes, points = data_dict['gt_boxes'], data_dict['points']
         points[:, :3] += noise_translate
         gt_boxes[:, :3] += noise_translate
+
+        if 'pseudo_boxes' in data_dict.keys():
+            data_dict['pseudo_boxes'][:, :3] += noise_translate
                 
         if 'roi_boxes' in data_dict.keys():
             data_dict['roi_boxes'][:, :3] += noise_translate
@@ -168,6 +193,8 @@ class DataAugmentor(object):
             gt_boxes, points = getattr(augmentor_utils, 'random_local_translation_along_%s' % cur_axis)(
                 gt_boxes, points, offset_range,
             )
+
+        assert 'pseudo_boxes' not in data_dict.keys(), '... pseudo not implemented'
 
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
@@ -200,6 +227,8 @@ class DataAugmentor(object):
             data_dict['gt_boxes'], data_dict['points'], config['LOCAL_SCALE_RANGE']
         )
 
+        assert 'pseudo_boxes' not in data_dict.keys(), '... pseudo not implemented'
+
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
         return data_dict
@@ -219,6 +248,9 @@ class DataAugmentor(object):
                 gt_boxes, points, intensity_range,
             )
 
+        assert 'pseudo_boxes' not in data_dict.keys(), '... pseudo not implemented'
+
+
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
         return data_dict
@@ -237,6 +269,9 @@ class DataAugmentor(object):
             gt_boxes, points = getattr(augmentor_utils, 'local_frustum_dropout_%s' % direction)(
                 gt_boxes, points, intensity_range,
             )
+
+        assert 'pseudo_boxes' not in data_dict.keys(), '... pseudo not implemented'
+
 
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
@@ -261,6 +296,8 @@ class DataAugmentor(object):
                                                                  config['SWAP_PROB'],
                                                                  config['SWAP_MAX_NUM'],
                                                                  pyramids)
+        assert 'pseudo_boxes' not in data_dict.keys(), '... pseudo not implemented'
+
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
         return data_dict
@@ -287,6 +324,41 @@ class DataAugmentor(object):
         data_dict["camera_imgs"] = new_imgs
         return data_dict
 
+    def load_frustum_pseudos(self, data_dict=None, config=None):
+        if data_dict is None:
+            self.pseudo_loader = PseudoLoader(known_class_names=config.KNOWN_CLASSES, pseudo_path=config.PSEUDO_PATH, 
+                                              self_train_path=config.get('SELF_TRAIN_PATH', None), dropout=config.get('DROPOUT', 0.5), 
+                                              min_score=config.get('MIN_SCORE', None), pseudo_nms_thresh=config.get('PSEUDO_NMS_THRESH', 0.1), 
+                                              max_selftrain_per_class=config.get('MAX_SELFTRAIN_PER_CLASS', None), fix_cp=config.get('FIX_CP', None), 
+                                              mom=config.get('MOMENTUM', 0.9), copy_st_only=config.get('COPY_ST_ONLY', False), 
+                                              sampler_val=config.get('SAMPLER_VAL', True))
+            
+            return partial(self.load_frustum_pseudos, config=config)
+        return self.pseudo_loader.load_frustum_pseudos(data_dict)
+    
+    def load_selftrain_pseudos(self, data_dict=None, config=None):
+        if data_dict is None:
+            if not hasattr(self, 'pseudo_loader') or (hasattr(self, 'pseudo_loader') and self.pseudo_loader is None): # if no frustum pseudos
+                self.pseudo_loader = PseudoLoader(known_class_names=config.KNOWN_CLASSES, pseudo_path=config.PSEUDO_PATH, 
+                                                self_train_path=config.get('SELF_TRAIN_PATH', None), dropout=config.get('DROPOUT', 0.5), 
+                                                min_score=config.get('MIN_SCORE', None), pseudo_nms_thresh=config.get('PSEUDO_NMS_THRESH', 0.1), 
+                                                max_selftrain_per_class=config.get('MAX_SELFTRAIN_PER_CLASS', None), fix_cp=config.get('FIX_CP', None), 
+                                                mom=config.get('MOMENTUM', 0.9), copy_st_only=config.get('COPY_ST_ONLY', False), 
+                                                sampler_val=config.get('SAMPLER_VAL', True))
+            return partial(self.load_selftrain_pseudos, config=config)
+    
+        return self.pseudo_loader.load_selftrain_pseudos(data_dict)
+    
+    def unknowns_copy_paste(self, data_dict=None, config=None):
+        if data_dict is None:
+            self.pseudo_loader.sampler.max_queue_size_per_class = config.get('MAX_QUEUE_SIZE', self.pseudo_loader.sampler.max_queue_size_per_class)
+            self.pseudo_loader.sampler.queue_metric = config.get('QUEUE_METRIC', self.pseudo_loader.sampler.queue_metric)
+            self.pseudo_loader.sampler.trans_noise = config.get('TRANS_NOISE', self.pseudo_loader.sampler.trans_noise)
+            self.pseudo_loader.sampler.rot_noise = config.get('ROT_NOISE', self.pseudo_loader.sampler.rot_noise)
+            self.pseudo_loader.sampler.timestamp = config.get('TIMESTAMP', self.pseudo_loader.sampler.timestamp)
+            return partial(self.unknowns_copy_paste, config=config)
+        return self.pseudo_loader.copy_and_paste(data_dict)
+
     def forward(self, data_dict):
         """
         Args:
@@ -300,6 +372,10 @@ class DataAugmentor(object):
         """
         for cur_augmentor in self.data_augmentor_queue:
             data_dict = cur_augmentor(data_dict=data_dict)
+
+        # if not using copy paste remove the scores
+        if 'pseudo_scores' in data_dict:
+            data_dict.pop('pseudo_scores')
 
         data_dict['gt_boxes'][:, 6] = common_utils.limit_period(
             data_dict['gt_boxes'][:, 6], offset=0.5, period=2 * np.pi

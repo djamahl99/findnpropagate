@@ -20,9 +20,12 @@ class NuScenesDataset(DatasetTemplate):
         )
         self.infos = []
         self.camera_config = self.dataset_cfg.get('CAMERA_CONFIG', None)
+        self.cam_without_image = False
+
         if self.camera_config is not None:
             self.use_camera = self.camera_config.get('USE_CAMERA', True)
             self.camera_image_config = self.camera_config.IMAGE
+            self.cam_without_image = self.camera_config.get('CAM_WITHOUT_IMAGE', self.cam_without_image)
         else:
             self.use_camera = False
 
@@ -152,6 +155,20 @@ class NuScenesDataset(DatasetTemplate):
         input_dict['camera_imgs'] = crop_images
         return input_dict
     
+    def fake_crop_image(self, input_dict):
+        W, H = input_dict["ori_shape"]
+        img_process_infos = []
+        for _ in range(6):
+            resize_lim = self.camera_image_config.RESIZE_LIM_TEST
+            resize = np.mean(resize_lim)
+            crop = (0, 0, W, H)
+
+            # reisze and crop image
+            img_process_infos.append([resize, crop, False, 0])
+        
+        input_dict['img_process_infos'] = img_process_infos
+        return input_dict
+
     def load_camera_info(self, input_dict, info):
         input_dict["image_paths"] = []
         input_dict["lidar2camera"] = []
@@ -195,17 +212,23 @@ class NuScenesDataset(DatasetTemplate):
             camera2lidar[:3, :3] = camera_info["sensor2lidar_rotation"]
             camera2lidar[:3, 3] = camera_info["sensor2lidar_translation"]
             input_dict["camera2lidar"].append(camera2lidar)
-        # read image
-        filename = input_dict["image_paths"]
-        images = []
-        for name in filename:
-            images.append(Image.open(str(self.root_path / name)))
-        
-        input_dict["camera_imgs"] = images
-        input_dict["ori_shape"] = images[0].size
-        
-        # resize and crop image
-        input_dict = self.crop_image(input_dict)
+        # we might just want the camera matrices (for projection), and no RGB
+        if not self.cam_without_image:
+            # read image
+            filename = input_dict["image_paths"]
+            images = []
+            for name in filename:
+                images.append(Image.open(str(self.root_path / name)))
+            
+            input_dict["camera_imgs"] = images
+            input_dict["ori_shape"] = images[0].size
+            
+            # resize and crop image
+            input_dict = self.crop_image(input_dict)
+        else:
+            fH, fW = self.camera_image_config.FINAL_DIM
+            input_dict["ori_shape"] = [fW, fH]
+            input_dict = self.fake_crop_image(input_dict)
 
         return input_dict
 
@@ -221,6 +244,8 @@ class NuScenesDataset(DatasetTemplate):
 
         info = copy.deepcopy(self.infos[index])
         points = self.get_lidar_with_sweeps(index, max_sweeps=self.dataset_cfg.MAX_SWEEPS)
+
+        # print('info', info)
 
         input_dict = {
             'points': points,
@@ -255,6 +280,7 @@ class NuScenesDataset(DatasetTemplate):
 
     def evaluation(self, det_annos, class_names, **kwargs):
         import json
+        import torch
         from nuscenes.nuscenes import NuScenes
         from . import nuscenes_utils
         nusc = NuScenes(version=self.dataset_cfg.VERSION, dataroot=str(self.root_path), verbose=True)
@@ -270,8 +296,16 @@ class NuScenesDataset(DatasetTemplate):
         output_path = Path(kwargs['output_path'])
         output_path.mkdir(exist_ok=True, parents=True)
         res_path = str(output_path / 'results_nusc.json')
-        with open(res_path, 'w') as f:
-            json.dump(nusc_annos, f)
+        # print('nusc_annos', nusc_annos)
+        print('res_path', res_path)
+        try:
+            with open(res_path, 'w') as f:
+                json.dump(nusc_annos, f)
+        except Exception as e:
+            print('err saving annos', e)
+            pkl_res_path = res_path.replace('.json', '.pkl')
+            print('saving as pkl', pkl_res_path)
+            torch.save(nusc_annos, pkl_res_path)
 
         self.logger.info(f'The predictions of NuScenes have been saved to {res_path}')
 
@@ -306,7 +340,7 @@ class NuScenesDataset(DatasetTemplate):
         with open(output_path / 'metrics_summary.json', 'r') as f:
             metrics = json.load(f)
 
-        result_str, result_dict = nuscenes_utils.format_nuscene_results(metrics, self.class_names, version=eval_version)
+        result_str, result_dict = nuscenes_utils.format_nuscene_results(metrics, class_names=['car','truck', 'construction_vehicle', 'bus', 'trailer', 'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'], version=eval_version)
         return result_str, result_dict
 
     def create_groundtruth_database(self, used_classes=None, max_sweeps=10):
@@ -412,23 +446,37 @@ if __name__ == '__main__':
     parser.add_argument('--func', type=str, default='create_nuscenes_infos', help='')
     parser.add_argument('--version', type=str, default='v1.0-trainval', help='')
     parser.add_argument('--with_cam', action='store_true', default=False, help='use camera or not')
+    parser.add_argument('--all_classes', action='store_true', default=False, help='whether to map to 10 class')
     args = parser.parse_args()
+
+    print('args', args)
+
+    save_folder = 'nuscenes'
+    if args.all_classes:
+        save_folder = 'nuscenes_26class'
 
     if args.func == 'create_nuscenes_infos':
         dataset_cfg = EasyDict(yaml.safe_load(open(args.cfg_file)))
         ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
         dataset_cfg.VERSION = args.version
-        create_nuscenes_info(
-            version=dataset_cfg.VERSION,
-            data_path=ROOT_DIR / 'data' / 'nuscenes',
-            save_path=ROOT_DIR / 'data' / 'nuscenes',
-            max_sweeps=dataset_cfg.MAX_SWEEPS,
-            with_cam=args.with_cam
-        )
 
-        nuscenes_dataset = NuScenesDataset(
-            dataset_cfg=dataset_cfg, class_names=None,
-            root_path=ROOT_DIR / 'data' / 'nuscenes',
-            logger=common_utils.create_logger(), training=True
-        )
-        nuscenes_dataset.create_groundtruth_database(max_sweeps=dataset_cfg.MAX_SWEEPS)
+        save_path = ROOT_DIR / 'data' / save_folder
+
+        if save_path.exists():
+            print(f'{save_path} exists!')
+            exit()
+
+        # create_nuscenes_info(
+        #     version=dataset_cfg.VERSION,
+        #     data_path=ROOT_DIR / 'data' / 'nuscenes',
+        #     save_path=ROOT_DIR / 'data' / save_folder,
+        #     max_sweeps=dataset_cfg.MAX_SWEEPS,
+        #     with_cam=args.with_cam
+        # )
+
+        # nuscenes_dataset = NuScenesDataset(
+        #     dataset_cfg=dataset_cfg, class_names=None,
+        #     root_path=ROOT_DIR / 'data' / save_folder,
+        #     logger=common_utils.create_logger(), training=True
+        # )
+        # nuscenes_dataset.create_groundtruth_database(max_sweeps=dataset_cfg.MAX_SWEEPS)

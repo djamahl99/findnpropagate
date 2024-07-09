@@ -2,6 +2,7 @@ import torch
 
 from ...utils import box_coder_utils, box_utils
 from .point_head_template import PointHeadTemplate
+from pcdet.models.dense_heads.pseudo_processor import PseudoProcessor
 
 
 class PointIntraPartOffsetHead(PointHeadTemplate):
@@ -11,7 +12,21 @@ class PointIntraPartOffsetHead(PointHeadTemplate):
     From Points to Parts: 3D Object Detection from Point Cloud with Part-aware and Part-aggregation Network
     """
     def __init__(self, num_class, input_channels, model_cfg, predict_boxes_when_training=False, **kwargs):
+        self.use_pseudo = model_cfg.get('USE_PSEUDO', False)
+
+        if self.use_pseudo:
+            assert 'KNOWN_CLASS_NAMES' in model_cfg, 'need KNOWN_CLASS_NAMES!'
+            assert 'ALL_CLASS_NAMES' in model_cfg, 'need ALL_CLASS_NAMES!'
+
+            known_class_names = model_cfg.get('KNOWN_CLASS_NAMES', [])
+            all_class_names = model_cfg.get('ALL_CLASS_NAMES', [])
+            self.pseudo_processor = PseudoProcessor(known_class_names, all_class_names=all_class_names)
+            num_class = self.pseudo_processor.num_classes # uses all classes to calculate
+        self.pseudo_nms_thresh = model_cfg.get('PSEUDO_NMS_THRESH', None)
+
         super().__init__(model_cfg=model_cfg, num_class=num_class)
+
+        
         self.predict_boxes_when_training = predict_boxes_when_training
         self.cls_layers = self.make_fc_layers(
             fc_cfg=self.model_cfg.CLS_FC,
@@ -90,6 +105,9 @@ class PointIntraPartOffsetHead(PointHeadTemplate):
                 point_cls_scores: (N1 + N2 + N3 + ..., 1)
                 point_part_offset: (N1 + N2 + N3 + ..., 3)
         """
+        if self.use_pseudo and self.training:
+            batch_dict = self.pseudo_processor(batch_dict)
+
         point_features = batch_dict['point_features']
         point_cls_preds = self.cls_layers(point_features)  # (total_points, num_class)
         point_part_preds = self.part_reg_layers(point_features)

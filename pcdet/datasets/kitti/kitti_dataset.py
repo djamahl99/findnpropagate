@@ -478,7 +478,8 @@ if __name__ == '__main__':
         ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
         create_kitti_infos(
             dataset_cfg=dataset_cfg,
-            class_names=['Car', 'Pedestrian', 'Cyclist'],
+            # class_names=['Misc', 'Tram', 'Pedestrian', 'Car', 'Truck', 'DontCare', 'Van', 'Person_sitting', 'Cyclist'],
+            class_names=['Car', 'Tram', 'Truck', 'Van', 'Person_sitting', 'Cyclist', 'Pedestrian'],
             data_path=ROOT_DIR / 'data' / 'kitti',
             save_path=ROOT_DIR / 'data' / 'kitti'
         )

@@ -3,7 +3,6 @@ import torch
 from ...utils import box_coder_utils, box_utils
 from .point_head_template import PointHeadTemplate
 
-
 class PointHeadBox(PointHeadTemplate):
     """
     A simple point-based segmentation head, which are used for PointRCNN.
@@ -11,6 +10,7 @@ class PointHeadBox(PointHeadTemplate):
     PointRCNN: 3D Object Proposal Generation and Detection from Point Cloud
     """
     def __init__(self, num_class, input_channels, model_cfg, predict_boxes_when_training=False, **kwargs):
+        num_class = 1
         super().__init__(model_cfg=model_cfg, num_class=num_class)
         self.predict_boxes_when_training = predict_boxes_when_training
         self.cls_layers = self.make_fc_layers(

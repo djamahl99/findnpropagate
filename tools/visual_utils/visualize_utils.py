@@ -10,6 +10,30 @@ box_colormap = [
 ]
 
 
+PALETTE = [(220, 20, 60), (119, 11, 32), (0, 0, 142), (0, 0, 230),
+            (106, 0, 228), (0, 60, 100), (0, 80, 100), (0, 0, 70),
+            (0, 0, 192), (250, 170, 30), (100, 170, 30), (220, 220, 0),
+            (175, 116, 175), (250, 0, 30), (165, 42, 42), (255, 77, 255),
+            (0, 226, 252), (182, 182, 255), (0, 82, 0), (120, 166, 157),
+            (110, 76, 0), (174, 57, 255), (199, 100, 0), (72, 0, 118),
+            (255, 179, 240), (0, 125, 92), (209, 0, 151), (188, 208, 182),
+            (0, 220, 176), (255, 99, 164), (92, 0, 73), (133, 129, 255),
+            (78, 180, 255), (0, 228, 0), (174, 255, 243), (45, 89, 255),
+            (134, 134, 103), (145, 148, 174), (255, 208, 186),
+            (197, 226, 255), (171, 134, 1), (109, 63, 54), (207, 138, 255),
+            (151, 0, 95), (9, 80, 61), (84, 105, 51), (74, 65, 105),
+            (166, 196, 102), (208, 195, 210), (255, 109, 65), (0, 143, 149),
+            (179, 0, 194), (209, 99, 106), (5, 121, 0), (227, 255, 205),
+            (147, 186, 208), (153, 69, 1), (3, 95, 161), (163, 255, 0),
+            (119, 0, 170), (0, 182, 199), (0, 165, 120), (183, 130, 88),
+            (95, 32, 0), (130, 114, 135), (110, 129, 133), (166, 74, 118),
+            (219, 142, 185), (79, 210, 114), (178, 90, 62), (65, 70, 15),
+            (127, 167, 115), (59, 105, 106), (142, 108, 45), (196, 172, 0),
+            (95, 54, 80), (128, 76, 255), (201, 57, 1), (246, 0, 122),
+            (191, 162, 208)]
+
+box_colormap = [[x/255 for x in y] for y in PALETTE]
+
 def check_numpy_to_torch(x):
     if isinstance(x, np.ndarray):
         return torch.from_numpy(x).float(), True
@@ -139,7 +163,7 @@ def draw_multi_grid_range(fig, grid_size=20, bv_range=(-60, -60, 60, 60)):
     return fig
 
 
-def draw_scenes(points, gt_boxes=None, ref_boxes=None, ref_scores=None, ref_labels=None):
+def draw_scenes(points, gt_boxes=None, ref_boxes=None, ref_scores=None, ref_labels=None, ref_classes=[]):
     if not isinstance(points, np.ndarray):
         points = points.cpu().numpy()
     if ref_boxes is not None and not isinstance(ref_boxes, np.ndarray):
@@ -155,7 +179,12 @@ def draw_scenes(points, gt_boxes=None, ref_boxes=None, ref_scores=None, ref_labe
     fig = draw_multi_grid_range(fig, bv_range=(0, -40, 80, 40))
     if gt_boxes is not None:
         corners3d = boxes_to_corners_3d(gt_boxes)
-        fig = draw_corners3d(corners3d, fig=fig, color=(0, 0, 1), max_num=100)
+        gt_labels = gt_boxes[..., -1].astype('int32') - 1
+
+        for k in range(gt_labels.min(), gt_labels.max() + 1):
+            mask = (gt_labels == k)
+            print('k', k, len(ref_classes))
+            fig = draw_corners3d(corners3d[mask], fig=fig, color=(0, 1, 0), max_num=100, cls=[f'TRUE {ref_classes[k]}' for i in range(corners3d.shape[0])])
 
     if ref_boxes is not None and len(ref_boxes) > 0:
         ref_corners3d = boxes_to_corners_3d(ref_boxes)
@@ -165,7 +194,7 @@ def draw_scenes(points, gt_boxes=None, ref_boxes=None, ref_scores=None, ref_labe
             for k in range(ref_labels.min(), ref_labels.max() + 1):
                 cur_color = tuple(box_colormap[k % len(box_colormap)])
                 mask = (ref_labels == k)
-                fig = draw_corners3d(ref_corners3d[mask], fig=fig, color=cur_color, cls=ref_scores[mask], max_num=100)
+                fig = draw_corners3d(ref_corners3d[mask], fig=fig, color=cur_color, cls=ref_scores[mask], max_num=100, tag=ref_classes[k])
     mlab.view(azimuth=-179, elevation=54.0, distance=104.0, roll=90.0)
     return fig
 
@@ -188,9 +217,9 @@ def draw_corners3d(corners3d, fig, color=(1, 1, 1), line_width=2, cls=None, tag=
 
         if cls is not None:
             if isinstance(cls, np.ndarray):
-                mlab.text3d(b[6, 0], b[6, 1], b[6, 2], '%.2f' % cls[n], scale=(0.3, 0.3, 0.3), color=color, figure=fig)
+                mlab.text3d(b[6, 0], b[6, 1], b[6, 2], tag + ' %.2f' % cls[n], scale=(1.0, 1.0, 1.0), color=color, figure=fig)
             else:
-                mlab.text3d(b[6, 0], b[6, 1], b[6, 2], '%s' % cls[n], scale=(0.3, 0.3, 0.3), color=color, figure=fig)
+                mlab.text3d(b[6, 0], b[6, 1], b[6, 2], tag + '%s' % cls[n], scale=(1.0, 1.0, 1.0), color=color, figure=fig)
 
         for k in range(0, 4):
             i, j = k, (k + 1) % 4

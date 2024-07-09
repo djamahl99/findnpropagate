@@ -2,20 +2,21 @@ import argparse
 import glob
 from pathlib import Path
 
-try:
-    import open3d
-    from visual_utils import open3d_vis_utils as V
-    OPEN3D_FLAG = True
-except:
-    import mayavi.mlab as mlab
-    from visual_utils import visualize_utils as V
-    OPEN3D_FLAG = False
+# try:
+#     import open3d
+#     from visual_utils import open3d_vis_utils as V
+#     OPEN3D_FLAG = True
+#     print('open3d')
+# except:
+import mayavi.mlab as mlab
+from visual_utils import visualize_utils as V
+OPEN3D_FLAG = False
 
 import numpy as np
 import torch
 
 from pcdet.config import cfg, cfg_from_yaml_file
-from pcdet.datasets import DatasetTemplate
+from pcdet.datasets import DatasetTemplate, NuScenesDataset
 from pcdet.models import build_network, load_data_to_gpu
 from pcdet.utils import common_utils
 
@@ -80,10 +81,20 @@ def main():
     args, cfg = parse_config()
     logger = common_utils.create_logger()
     logger.info('-----------------Quick Demo of OpenPCDet-------------------------')
-    demo_dataset = DemoDataset(
-        dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES, training=False,
-        root_path=Path(args.data_path), ext=args.ext, logger=logger
-    )
+    # demo_dataset = DemoDataset(
+    #     dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES, training=False,
+    #     root_path=Path(args.data_path), ext=args.ext, logger=logger
+    # )
+    # ROOT_DIR = Path('')
+    all_class_names = ['car','truck', 'construction_vehicle', 'bus', 'trailer',
+              'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+    class_names = cfg.CLASS_NAMES
+    demo_dataset = NuScenesDataset(
+            dataset_cfg=cfg.DATA_CONFIG, class_names=all_class_names,
+            # root_path=ROOT_DIR / 'data' / 'nuscenes',
+            root_path=Path('/home/uqdetche/OpenPCDet/data/nuscenes'),
+            logger=common_utils.create_logger(), training=False
+        )
     logger.info(f'Total number of samples: \t{len(demo_dataset)}')
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=demo_dataset)
@@ -97,9 +108,42 @@ def main():
             load_data_to_gpu(data_dict)
             pred_dicts, _ = model.forward(data_dict)
 
+            print('data_dict', data_dict.keys())
+            # exit
+
+            pred_boxes = pred_dicts[0]['pred_boxes']
+            pred_scores = pred_dicts[0]['pred_scores']
+            pred_labels = pred_dicts[0]['pred_labels']
+
+            print('boxes before', pred_boxes.shape)
+            print('scores', pred_scores.shape)
+
+            print('min scores')
+
+            gt_boxes = data_dict['gt_boxes'][0]
+            num_gt = gt_boxes.shape[0]
+
+            best_keys = torch.topk(pred_scores, dim=0, k=num_gt)
+            print('best scores min/max', best_keys.values.min(), best_keys.values.max())
+
+            idx = pred_scores > 0.1
+            # idx = best_keys.indices
+
+            pred_boxes = pred_boxes[idx]
+            pred_scores = pred_scores[idx]
+            pred_labels = pred_labels[idx] - 1
+
+            # for label in pred_labels:
+                # print("class:", all_class_names[label.item()], label.item())
+
+            print('boxes after', pred_boxes.shape)
+
+
+            print('gt', gt_boxes.shape)
+
             V.draw_scenes(
-                points=data_dict['points'][:, 1:], ref_boxes=pred_dicts[0]['pred_boxes'],
-                ref_scores=pred_dicts[0]['pred_scores'], ref_labels=pred_dicts[0]['pred_labels']
+                points=data_dict['points'][:, 1:], gt_boxes=gt_boxes, ref_boxes=pred_boxes,
+                ref_scores=pred_scores, ref_labels=pred_labels, ref_classes=all_class_names
             )
 
             if not OPEN3D_FLAG:

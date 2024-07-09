@@ -5,6 +5,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.nn.init import kaiming_normal_
+from torch import distributions as D
 from ..model_utils.transfusion_utils import clip_sigmoid
 from ..model_utils.basic_block_2d import BasicBlock2D
 from ..model_utils.transfusion_utils import PositionEmbeddingLearned, TransformerDecoderLayer
@@ -83,12 +84,12 @@ class DenseConvAnchorQueries(nn.Module):
 
         self.heatmap_to_weights = nn.Sequential(
             nn.Linear(self.text_dim, self.text_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(self.text_dim, self.text_dim*k*k),
         )
 
-        self.bias = nn.Parameter(torch.ones(1) * -10)
-        self.scale = nn.Parameter(torch.ones(1) * np.log(10))
+        self.bias = WrappedParameter(torch.ones(1) * -10)
+        self.scale = WrappedParameter(torch.ones(1) * np.log(10))
 
         # self.to_mu = nn.Linear(self.text_dim, 2)
         # self.to_var = nn.Linear(self.text_dim, 2)
@@ -123,10 +124,116 @@ class DenseConvAnchorQueries(nn.Module):
 
         out = F.conv2d(input=heatmap, weight=weights, bias=None, padding='same')
 
-        out = out * self.scale.exp() + self.bias
+        out = out * self.scale.value.exp() + self.bias.value
 
         return out
     
+class GaussianHead(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, mus: Tensor, covs: Tensor, xs: Tensor):
+        covs = covs.reshape(-1, 3)
+        mus = mus.reshape(-1, 3)
+
+        BN = covs.shape[0]
+
+        # dist = D.MultivariateNormal(loc=mus, covariance_matrix=covs)
+        dist = D.Normal(mus, covs)
+
+        return dist.log_prob(xs)
+
+class GaussianStatsTracker(nn.Module):
+    def __init__(self, anchors: torch.tensor, steps=20) -> None:
+        super().__init__()
+
+        self.num_classes = anchors.shape[0]
+        self.steps = steps
+
+        self.buffer_length = 100
+        self.buffer_idx = [0 for i in range(self.num_classes)]
+        self.buffer = torch.zeros(self.num_classes, 3, self.buffer_length, device='cuda')
+        self.buffer_mask = torch.zeros(self.num_classes, self.buffer_length, dtype=torch.bool, device='cuda')
+
+        self.anchors = anchors.clone()
+
+        # initialize with anchors
+        self.mus = anchors.clone()
+        self.covs = torch.eye(3, device='cuda').unsqueeze(0).repeat(self.num_classes, 1, 1) * 0.1 # 1m variance
+    
+        self.mom = 0.1
+
+        self.grid = self.get_grid(anchors, buff=0.1, steps=self.steps).to('cuda')
+
+    def get_grid(self, anchors, buff=0.5, steps=10):
+        def get_axis_linspace(axis_values, buff, steps):
+            xlow, xup = axis_values.min(), axis_values.max()
+            xrang = xup - xlow
+
+            xlow = xlow - xrang * max(buff, 0.01)
+            xup = xup + xrang * max(buff, 0.01)
+            xs = torch.linspace(xlow, xup, steps)
+
+            return xs
+        
+        xs = get_axis_linspace(anchors[:, 0], buff, steps)
+        ys = get_axis_linspace(anchors[:, 1], buff, steps)
+        zs = get_axis_linspace(anchors[:, 2], buff, steps)
+
+        self.xlim = (xs.min().item(), xs.max().item())
+        self.ylim = (ys.min().item(), ys.max().item())
+        self.zlim = (zs.min().item(), zs.max().item())
+
+
+        xs, ys, zs = torch.meshgrid([xs, ys, zs], indexing='ij')
+        xyzs = torch.cat((xs[None], ys[None], zs[None]), dim=0).permute(1, 2, 3, 0)
+
+        self.range = (xyzs.min().item(), xyzs.max().item())
+
+        return xyzs
+
+    def forward(self):
+        # returns the log prob for each anchor vector
+        anchor_embs = []
+        for i in range(self.num_classes):
+            mu, cov = self.mus[i], self.covs[i]
+
+            x = self.grid.reshape(-1, 3)
+            dist = torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=cov)
+
+            logits = dist.log_prob(x)
+            # reshape back
+            # logits = logits.reshape(self.grid.shape[:-1])
+
+            anchor_embs.append(logits[..., None])
+
+        anchor_embs = torch.cat(anchor_embs, dim=-1)
+
+        print('anchor embs', anchor_embs.shape)
+
+        anchor_embs = anchor_embs.reshape(-1, self.num_classes).permute(1, 0)
+
+        return anchor_embs
+
+    def update_stats(self, labels: Tensor, dims: Tensor):
+        # update the mean and covariance for each class using our buffer
+        for cls_idx in range(self.num_classes):
+            mask = labels == cls_idx
+            num_pos = (mask * 1).sum()
+            cls_dims = dims[mask]
+            
+            if num_pos > 0:
+                # add to buffer
+                for i in range(int(num_pos)):
+                    self.buffer_idx[cls_idx] = (self.buffer_idx[cls_idx] + 1) % self.buffer_length
+                    self.buffer[cls_idx, :, self.buffer_idx[cls_idx]] = cls_dims[i, :]
+                    self.buffer_mask[cls_idx, self.buffer_idx[cls_idx]] = 1.0
+
+            buff_length = torch.count_nonzero(self.buffer_mask[cls_idx])
+            if buff_length > 3: # if not at least 3 in the buffer, don't update the stats
+                self.mus[cls_idx] = self.mom * self.mus[cls_idx] + (1.0 - self.mom) * torch.mean(self.buffer[cls_idx, :, :buff_length], dim=1)
+                self.covs[cls_idx] = self.mom * self.covs[cls_idx] + (1.0 - self.mom) * torch.cov(self.buffer[cls_idx, :, :buff_length])
+
 class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
     """
         This module implements TransFusionHead.
@@ -170,7 +277,7 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         if not self.use_sigmoid_cls:
             self.num_classes += 1
         self.loss_cls = loss_utils.SigmoidFocalClassificationLoss(gamma=loss_cls.gamma,alpha=loss_cls.alpha)
-        # self.loss_cls = nn.BCEWithLogitsLoss(reduction='none')
+        self.loss_bce = nn.BCEWithLogitsLoss(reduction='none')
         self.loss_cls_weight = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['cls_weight']
         self.loss_bbox = loss_utils.L1Loss()
         self.loss_bbox_weight = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['bbox_weight']
@@ -203,7 +310,26 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
             [0.41, 0.41, 1.07]
         ]
         self.anchors = torch.tensor(anchors, dtype=torch.float32, requires_grad=False, device='cuda').log()
-        self.anchor_size_bins = 30
+        self.class_stats_tracker = GaussianStatsTracker(self.anchors)
+
+        # self.anchor_size_bins = 30
+        # self.initialize_vector_values()
+
+        # self.orig_vector_values = self.vector_values.clone()
+        # # network can adjust
+        # # self.vector_values = WrappedParameter(self.vector_values)
+
+        # self.text_dim = 3 * self.anchor_size_bins # to match what relu_bin_vectors had
+        # self.text_classes = self.anchors.shape[0]
+
+        # # self.text_features = vecify_vals(torch.tensor(anchors)) # use relu_bin_vectors in future
+        # # self.anchor_vecs = hard_quantile_bin_vectors(self.anchors, num_bins=self.anchor_size_bins)
+        # self.anchor_vecs = self.hard_bin_vectors(self.anchors)
+
+        # # text_features is normalized
+        # self.anchor_vecs_normed = self.anchor_vecs.clone()
+        # self.anchor_vecs_normed = self.anchor_vecs_normed / (1e-8 + torch.norm(self.anchor_vecs_normed, dim=1, keepdim=True))
+
         self.text_dim = 64
         self.text_classes = self.anchors.shape[0]
 
@@ -214,26 +340,22 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         layers.append(nn.Conv2d(in_channels=hidden_channel,out_channels=self.text_dim,kernel_size=3,padding=1))
         self.heatmap_head = nn.Sequential(*layers)
 
-        self.heatmap_head_matching = DenseConvAnchorQueries(self.text_dim, k=10)
+        self.heatmap_head_matching = DenseConvAnchorQueries(self.text_dim, k=3)
 
         self.logit_scale = WrappedParameter(torch.ones(1, requires_grad=True) * np.log(10))
         self.logit_bias = WrappedParameter(torch.ones(1) * -10.0)
 
-        # self.loss_logit_scale = WrappedParameter(torch.ones(1, requires_grad=True) * np.log(10))
-        # self.loss_logit_bias = WrappedParameter(torch.ones(1) * -10.0)
-
         self.iou_prop = WrappedParameter(torch.zeros(1, requires_grad=True))
-
-        # self.hm_logit_scale = WrappedParameter(torch.ones(1, requires_grad=True) * np.log(10))
-        # self.hm_logit_bias = WrappedParameter(torch.ones(1) * -10.0)
 
         self.temperature = 1.0
 
+        # self.anchor_encoding = nn.Linear(3, self.text_dim)
         self.anchor_encoding = nn.Sequential(
             nn.Linear(3, self.text_dim),
-            nn.GELU(),
-            nn.Linear(self.text_dim, self.text_dim),
+            nn.ReLU(),
+            nn.Linear(self.text_dim, self.text_dim)
         )
+        
         self.anchor_query_encoding = nn.Conv1d(self.text_dim, hidden_channel, 1)
 
         # transformer decoder layers for object query with LiDAR feature
@@ -245,7 +367,10 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         heads = copy.deepcopy(self.model_cfg.SEPARATE_HEAD_CFG.HEAD_DICT)
         heads['heatmap'] = dict(out_channels=self.text_dim, num_conv=self.model_cfg.NUM_HM_CONV)
         heads['iou_head'] = dict(out_channels=1, num_conv=self.model_cfg.NUM_HM_CONV)
-        self.prediction_head = SeparateHead_Transfusion(hidden_channel, hidden_channel, 1, heads, use_bias=bias)
+        # heads['mu_head'] = dict(out_channels=3, num_conv=self.model_cfg.NUM_HM_CONV)
+        # heads['cov_head'] = dict(out_channels=3, num_conv=self.model_cfg.NUM_HM_CONV)
+        self.prediction_head = SeparateHead_Transfusion(hidden_channel, 64, 1, heads, use_bias=bias)
+        # self.gaussian_head = GaussianHead()
 
         self.init_weights()
         self.bbox_assigner = HungarianAssigner3D(**self.model_cfg.TARGET_ASSIGNER_CONFIG.HUNGARIAN_ASSIGNER)
@@ -256,6 +381,45 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         self.bev_pos = self.create_2D_grid(x_size, y_size)
 
         self.forward_ret_dict = {}
+
+    def initialize_vector_values(self):
+        # self.qs = torch.linspace(0.0, 1.0, self.anchor_size_bins, device=self.anchors.device)
+        # values = torch.tensor([torch.quantile(self.anchors[:, i], q=self.qs) for i in range(3)], device=self.anchors.device)
+        # values = torch.quantile(self.anchors, q=self.qs).to(self.anchors.device)
+        values = torch.linspace(self.class_stats_tracker.range[0], self.class_stats_tracker.range[1], steps=self.anchor_size_bins, device=self.anchors.device)
+        self.value_inc = values[1] - values[0]
+        values = values.reshape(1, 1, -1)
+
+        self.vector_values = values
+
+    def sigmoid_bin_vectors(self, anchors: torch.tensor):
+        seq_len, seq_dim = anchors.shape
+
+        values = self.vector_values
+
+        anchors = anchors.unsqueeze(2).repeat(1, 1, self.anchor_size_bins)
+
+        anchors = anchors - values
+        anchors = torch.sigmoid(10.0 * anchors)
+
+        anchors = anchors.reshape(seq_len, seq_dim * self.anchor_size_bins)
+
+        return anchors
+    
+    def hard_bin_vectors(self, anchors: torch.tensor):
+        seq_len, seq_dim = anchors.shape
+
+        values = self.vector_values
+
+        anchors = anchors.unsqueeze(2).repeat(1, 1, self.anchor_size_bins)
+
+        anchors = anchors - values
+
+        anchors = (anchors > 0) * 1.0
+
+        anchors = anchors.reshape(seq_len, seq_dim * self.anchor_size_bins)
+
+        return anchors
 
     def create_2D_grid(self, x_size, y_size):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
@@ -303,7 +467,7 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         # normalize the object size prediction
         # dense_heatmap = dense_heatmap.clone() / (1e-8 + torch.norm(dense_heatmap.clone(), dim=1, keepdim=True))
         
-        regression_heatmap = dense_heatmap.clone()
+        # regression_heatmap = dense_heatmap.clone()
 
         # logit_scale = self.hm_logit_scale().exp()
         # dense_heatmap = logit_scale * dense_heatmap @ self.anchor_vecs_normed.t() + self.hm_logit_bias()
@@ -397,7 +561,7 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
             dim=-1,
         )
         res_layer["dense_heatmap"] = dense_heatmap
-        res_layer['regression_heatmap'] = regression_heatmap
+        # res_layer['regression_heatmap'] = regression_heatmap
 
         return res_layer
 
@@ -599,11 +763,11 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         # loss_dict[f"loss_logit_bias"] = self.loss_logit_bias().detach().clone()
         loss_dict[f"iou_prop"] = self.iou_prop.value.detach().clone().sigmoid()
         # loss_dict[f"hm_logit_bias"] = self.hm_logit_bias.value.detach().clone()
-        loss_dict[f"hm_logit_bias"] = self.heatmap_head_matching.bias.detach().clone()
+        loss_dict[f"hm_logit_bias"] = self.heatmap_head_matching.bias.value.detach().clone()
         loss_dict[f"logit_scale"] = self.logit_scale.value.detach().clone().exp()
         # loss_dict[f"loss_logit_scale"] = self.loss_logit_scale().detach().clone().exp()
         # loss_dict[f"hm_logit_scale"] = self.hm_logit_scale().detach().clone().exp()
-        loss_dict[f"hm_logit_scale"] = self.heatmap_head_matching.scale.detach().clone().exp()
+        loss_dict[f"hm_logit_scale"] = self.heatmap_head_matching.scale.value.detach().clone().exp()
         loss_dict[f"non_matched_mean_conf"] = cls_score_sigmoid[labels == 10].mean()
         loss_dict[f"non_matched_iou_pred"] = iou_score_sigmoid[labels == 10].mean()
         loss_dict[f"matched_mean_conf"] = matched_cls_score_sigmoid.mean()
@@ -614,6 +778,9 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
 
         bbox_targets_dim = bbox_targets.detach().clone().reshape(-1, 10)[:, 3:6]
         bbox_targets_dim = bbox_targets_dim[pos_labels_mask]#.exp()
+        # update our statistics
+        self.class_stats_tracker.update_stats(pos_labels, bbox_targets_dim)
+
         flat_bbox_targets = bbox_targets.detach().clone().reshape(-1, 10)
 
         total_matches = ((labels < self.num_classes) * 1.0).sum()
@@ -635,16 +802,15 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
             loss_dict[f"{cls_name}_tp_pred_conf_mean"] = v.mean()
             loss_dict[f"{cls_name}_matches"] = num_matches
             loss_dict[f"{cls_name}_iou_mean"] = v_ious.mean()
-            loss_dict[f"{cls_name}_height_mean"] = v_height.mean()
+            # loss_dict[f"{cls_name}_height_mean"] = v_height.mean()
+            # scale bbox weights
             loss_dict[f"{cls_name}_scale_factor"] = class_scale_factors[known_idx]
 
-            # scale bbox weights
             bbox_weights[labels_orig == known_idx, :] *= class_scale_factors[known_idx]
             label_weights[labels == known_idx] *= class_scale_factors[known_idx]
 
-            # for i, dim_name in enumerate(['length', 'width', 'height']):
-            #     values = bbox_targets_dim[cls_pos_labels_mask, i].exp()
-            #     loss_dict[f"{cls_name}_mean_{dim_name}"] = values.mean()
+            for i, dim_name in enumerate(['length', 'width', 'height']):
+                loss_dict[f"{cls_name}_mean_{dim_name}"] = self.class_stats_tracker.mus[known_idx, i]
                 # loss_dict[f"{cls_name}_var_{dim_name}"] = values.var()
 
         cls_argmax = torch.argmax(cls_score_sigmoid, dim=-1)
@@ -691,48 +857,67 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         with torch.no_grad():
             # bbox_preds_as_targets = self.anchor_encoding(bbox_preds)
             positive_anchors = self.anchor_encoding(bbox_targets_dim)
+            # positive_anchors = self.hard_bin_vectors(bbox_targets_dim)
 
-        bbox_alignment_loss = 0#F.cosine_embedding_loss(sep_heatmap_embs[labels < self.num_classes], bbox_preds_as_targets[labels < self.num_classes], target=torch.ones(positive_anchors.shape[0], device=cls_score.device, dtype=torch.long))
-        # loss_dict["bbox_alignment_loss"] = bbox_alignment_loss.item()
+        # gaussian log prob loss
+        # pos_mu_preds = pred_dicts["mu_head"].reshape(-1, 3)[pos_labels_mask]
+        # pos_cov_preds = pred_dicts["cov_head"].reshape(-1, 3)[pos_labels_mask].abs()
+        # pos_cov_preds = torch.bmm(pos_cov_preds, pos_cov_preds.permute(0, 2, 1)) # positive semi-definite
 
-        # no_grad above
-        # preds_alignment_loss = F.cosine_embedding_loss(bbox_preds_as_targets[labels < self.num_classes], positive_anchors, target=torch.ones(positive_anchors.shape[0], device=cls_score.device, dtype=torch.long))
-        preds_alignment_loss = 0
-        # loss_dict["preds_alignment_loss"] = 0 #preds_alignment_loss.item()
-
-        # cos_embedding_loss = F.cosine_embedding_loss(sep_heatmap_embs[pos_labels_mask], positive_anchors, target=torch.ones(positive_anchors.shape[0], device=positive_anchors.device, dtype=torch.long))
+        # log_probs = self.gaussian_head(pos_mu_preds, pos_cov_preds, bbox_targets_dim)
+        # loss_log_probs = - log_probs.exp().mean()
+        # loss_dict[f"loss_log_probs"] = loss_log_probs.item()
+        loss_log_probs = 0
 
         # default anchors should align well with the targets
-        default_anchors = self.anchor_vecs_normed[pos_labels]
-        cos_embedding_loss = F.cosine_embedding_loss(default_anchors, positive_anchors, target=torch.ones(positive_anchors.shape[0], device=positive_anchors.device, dtype=torch.long))
+        # default_anchors = self.anchor_vecs_normed[pos_labels]
+        cos_embedding_loss = F.cosine_embedding_loss(sep_heatmap_embs[pos_labels_mask], positive_anchors, target=torch.ones(positive_anchors.shape[0], device=positive_anchors.device, dtype=torch.long))
         loss_dict[f"loss_cos_emb"] = cos_embedding_loss.item()
+        # cos_embedding_loss = 0
 
-        pos_sep_heatmap_embs = sep_heatmap_embs[pos_labels_mask]
-        N = pos_sep_heatmap_embs.shape[0]
+            # pos_sep_heatmap_embs = sep_heatmap_embs[pos_labels_mask]
+            # N = pos_sep_heatmap_embs.shape[0]
 
-        diag_weights = torch.ones((N, N), device='cuda') * (1.0 - torch.eye(N, device='cuda'))
-        sim_label_weights = 1.0 * torch.eye(N, device='cuda') + (1.0 / N) * diag_weights
-        dense_labels = 2 * torch.eye(N, device='cuda') - torch.ones((N, N), device='cuda') # -1 with diagonal 1
+            # # neg_weight = (1.0 / (N*N))
+            # # neg_weight = 0.0
+            # non_diag_mask = torch.ones((N, N), device='cuda') * (1.0 - torch.eye(N, device='cuda'))
+            # sim_label_weights = torch.eye(N, device='cuda') #+ neg_weight * non_diag_mask
+            # dense_labels = 2 * torch.eye(N, device='cuda') - torch.ones((N, N), device='cuda') # -1 with diagonal 1
 
-        labels_altered = 0
-        # same class should have positive association, not just along the diagonal
-        for i in range(N):
-            for j in range(N):
-                if i != j and pos_labels[i] == pos_labels[j] and dense_labels[i, j] < 0:
-                    labels_altered += 1
-                    dense_labels[i, j] = 1.0 # these are the same class, should have similar anchor embeddings
+            # positive_anchors = positive_anchors.clone() / (1e-8 + torch.norm(positive_anchors.clone(), dim=1, keepdim=True))
+            # sims = pos_sep_heatmap_embs @ positive_anchors.t()
 
-        sim_label_weights *= label_weights[pos_labels_mask].reshape(-1, 1)
+            # labels_altered = 0
+            # # same class should have positive association, not just along the diagonal
+            # for i in range(N):
+            #     for j in range(N):
+            #         if i != j and pos_labels[i] == pos_labels[j] and dense_labels[i, j] < 0:
+            #             labels_altered += 1
+            #             dense_labels[i, j] = 1.0 # these are the same class, should have similar anchor embeddings
 
-        loss_dict["labels_altered"] = labels_altered
-        loss_dict["prop_pos_assoc"] = ((dense_labels == 1.0) * 1.0).sum() / (N*N)
-        loss_dict["prop_neg_assoc"] = ((dense_labels == - 1.0) * 1.0).sum() / (N*N)
+            # # non_diag_sims = sims[non_diag_mask > 0]
+            # # for hardest negative want the smallest k values
+            # # hard_thresh = torch.topk(non_diag_sims.reshape(-1), largest=False, k=N).values.max()
+            # # loss_dict["hard_thresh"] = hard_thresh.item()
 
-        positive_anchors = positive_anchors.clone() / (1e-8 + torch.norm(positive_anchors.clone(), dim=1, keepdim=True))
-        sims = pos_sep_heatmap_embs @ positive_anchors.t()
-        logits = sims * self.logit_scale().exp() + self.logit_bias()
-        loss_sigmoid_align = - torch.sum(sim_label_weights * F.logsigmoid(dense_labels * logits)) / N
-        # loss_sigmoid_align = - torch.sum(sim_label_weights * dense_labels * logits) / N
+            # # non_diag_weights = non_diag_mask * (sims < hard_thresh) * 1.0
+            # # sim_label_weights = torch.eye(N, device='cuda') + non_diag_weights
+
+            # # only the top N hardest negative and the N diag.
+            # # sim_label_weights *= label_weights[pos_labels_mask].reshape(-1, 1)
+
+            # # loss_dict["labels_altered"] = labels_altered
+            # loss_dict["prop_pos_assoc"] = ((dense_labels > 0) * 1.0).sum() / (N*N)
+            # loss_dict["prop_neg_assoc"] = ((dense_labels < 0) * 1.0).sum() / (N*N)
+
+            # # logits = sims * self.logit_scale().exp() + self.logit_bias()
+            # # loss_sigmoid_align = - torch.sum(sim_label_weights * F.logsigmoid(dense_labels * logits)) / N
+
+            # sim_label_weights = sim_label_weights / loss_dict["prop_pos_assoc"] + non_diag_mask / loss_dict["prop_neg_assoc"]
+            # loss_sigmoid_align = - torch.mean(sim_label_weights * dense_labels * sims)
+
+        # dense_labels = dense_labels.clamp(0.0, 1.0) # -1, 1 -> 0, 1
+        # loss_sigmoid_align = self.loss_bce(logits, dense_labels).mean()
 
         # logits = (pos_sep_heatmap_embs @ positive_anchors.T) / self.temperature
         # objects_similarity = pos_sep_heatmap_embs @ pos_sep_heatmap_embs.T
@@ -745,17 +930,28 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         # loss_sigmoid_align =  (images_loss + texts_loss) / 2.0 # shape: (batch_size)
         # loss_sigmoid_align = loss_sigmoid_align.mean()
 
-        loss_dict[f"loss_sigmoid_align"] = loss_sigmoid_align.item()
+        # loss_sigmoid_align = 0
+        # loss_dict[f"loss_sigmoid_align"] = loss_sigmoid_align.item()
         # loss_cls = loss_sigmoid_align
+
+        dense_labels = 2 * torch.eye(self.num_classes, device='cuda') - torch.ones((self.num_classes, self.num_classes), device='cuda') # -1 with diagonal 1
+
+        anchor_sim = self.anchor_vecs_normed @ self.anchor_vecs_normed.t()
+        anchor_sim_loss = - torch.mean(anchor_sim * dense_labels)
+
+        loss_dict['loss_anchor_sim'] = anchor_sim_loss.item()
 
         # think it makes sense for open-vocab to only enforce the loss on the known samples
         loss_cls = self.loss_cls(
             cls_score[pos_labels_mask], one_hot_targets[pos_labels_mask], label_weights[pos_labels_mask]
         ).sum() / max(num_pos, 1)
 
+        # loss_iou = (F.binary_cross_entropy_with_logits(
+        #     iou_score[pos_labels_mask], matched_ious[pos_labels_mask].reshape(-1, 1), reduction='none'
+        # ) * label_weights[pos_labels_mask].reshape(-1, 1)).sum() / max(num_pos, 1)
         loss_iou = (F.binary_cross_entropy_with_logits(
-            iou_score[pos_labels_mask], matched_ious[pos_labels_mask].reshape(-1, 1), reduction='none'
-        ) * label_weights[pos_labels_mask].reshape(-1, 1)).sum() / max(num_pos, 1)
+            iou_score, matched_ious.reshape(-1, 1), reduction='none'
+        ) * label_weights.reshape(-1, 1)).sum() / self.num_proposals
 
         loss_dict[f'loss_iou_bce'] = loss_iou.item()
 
@@ -769,8 +965,7 @@ class TransFusionHeadAnchorMatchingLearntVectors(nn.Module):
         loss_dict["loss_cls"] = loss_cls.item() * self.loss_cls_weight
         loss_dict["loss_bbox"] = loss_bbox.item() * self.loss_bbox_weight
         loss_all = loss_all + loss_cls * self.loss_cls_weight + loss_bbox * self.loss_bbox_weight \
-            + cos_embedding_loss * self.loss_bbox_weight  + bbox_alignment_loss * self.loss_bbox_weight \
-                + preds_alignment_loss * self.loss_bbox_weight + loss_sigmoid_align + loss_iou
+            + cos_embedding_loss * self.loss_bbox_weight + anchor_sim_loss + loss_iou + loss_log_probs
 
         loss_dict[f"matched_ious"] = matched_ious[labels < self.num_classes].mean()
 

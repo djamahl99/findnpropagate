@@ -101,7 +101,10 @@ class HungarianAssigner3D:
             if num_gts == 0:
                 # No ground truth, assign all to background
                 assigned_gt_inds[:] = 0
-            return num_gts, assigned_gt_inds, max_overlaps, assigned_labels
+            # return num_gts, assigned_gt_inds, max_overlaps, assigned_labels
+            return assigned_gt_inds, torch.zeros_like(assigned_gt_inds, dtype=torch.float)
+            # return None, None
+        
 
         # 2. compute the weighted costs
         cls_cost = self.focal_loss_cost(cls_pred[0].T, gt_labels)

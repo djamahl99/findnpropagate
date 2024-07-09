@@ -71,7 +71,142 @@ class SigmoidFocalClassificationLoss(nn.Module):
         assert weights.shape.__len__() == loss.shape.__len__()
 
         return loss * weights
+    
+class SigmoidClassificationLoss(nn.Module):
+    """
+    Sigmoid focal cross entropy loss.
+    """
 
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.25):
+        """
+        Args:
+            gamma: Weighting parameter to balance loss for hard and easy examples.
+            alpha: Weighting parameter to balance loss for positive and negative examples.
+        """
+        super(SigmoidClassificationLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    @staticmethod
+    def sigmoid_cross_entropy_with_logits(input: torch.Tensor, target: torch.Tensor):
+        """ PyTorch Implementation for tf.nn.sigmoid_cross_entropy_with_logits:
+            max(x, 0) - x * z + log(1 + exp(-abs(x))) in
+            https://www.tensorflow.org/api_docs/python/tf/nn/sigmoid_cross_entropy_with_logits
+
+        Args:
+            input: (B, #anchors, #classes) float tensor.
+                Predicted logits for each class
+            target: (B, #anchors, #classes) float tensor.
+                One-hot encoded classification targets
+
+        Returns:
+            loss: (B, #anchors, #classes) float tensor.
+                Sigmoid cross entropy loss without reduction
+        """
+        loss = torch.clamp(input, min=0) - input * target + \
+               torch.log1p(torch.exp(-torch.abs(input)))
+        return loss
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor, weights: torch.Tensor):
+        """
+        Args:
+            input: (B, #anchors, #classes) float tensor.
+                Predicted logits for each class
+            target: (B, #anchors, #classes) float tensor.
+                One-hot encoded classification targets
+            weights: (B, #anchors) float tensor.
+                Anchor-wise weights.
+
+        Returns:
+            weighted_loss: (B, #anchors, #classes) float tensor after weighting.
+        """
+
+        loss = self.sigmoid_cross_entropy_with_logits(input, target)
+
+        if weights.shape.__len__() == 2 or \
+                (weights.shape.__len__() == 1 and target.shape.__len__() == 2):
+            weights = weights.unsqueeze(-1)
+
+        assert weights.shape.__len__() == loss.shape.__len__()
+
+        return loss * weights
+
+from torchvision.ops import sigmoid_focal_loss
+class Poly1SigmoidFocalClassificationLoss(nn.Module):
+    """
+    Sigmoid focal cross entropy loss.
+    """
+
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.25, epsilon: float = 1.0):
+        """
+        Args:
+            gamma: Weighting parameter to balance loss for hard and easy examples.
+            alpha: Weighting parameter to balance loss for positive and negative examples.
+        """
+        super(Poly1SigmoidFocalClassificationLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+
+    @staticmethod
+    def sigmoid_cross_entropy_with_logits(input: torch.Tensor, target: torch.Tensor):
+        """ PyTorch Implementation for tf.nn.sigmoid_cross_entropy_with_logits:
+            max(x, 0) - x * z + log(1 + exp(-abs(x))) in
+            https://www.tensorflow.org/api_docs/python/tf/nn/sigmoid_cross_entropy_with_logits
+
+        Args:
+            input: (B, #anchors, #classes) float tensor.
+                Predicted logits for each class
+            target: (B, #anchors, #classes) float tensor.
+                One-hot encoded classification targets
+
+        Returns:
+            loss: (B, #anchors, #classes) float tensor.
+                Sigmoid cross entropy loss without reduction
+        """
+        loss = torch.clamp(input, min=0) - input * target + \
+               torch.log1p(torch.exp(-torch.abs(input)))
+        return loss
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor, weights: torch.Tensor):
+        """
+        Args:
+            input: (B, #anchors, #classes) float tensor.
+                Predicted logits for each class
+            target: (B, #anchors, #classes) float tensor.
+                One-hot encoded classification targets
+            weights: (B, #anchors) float tensor.
+                Anchor-wise weights.
+
+        Returns:
+            weighted_loss: (B, #anchors, #classes) float tensor after weighting.
+        """
+        # focal loss implementation taken from
+        # https://github.com/facebookresearch/fvcore/blob/main/fvcore/nn/focal_loss.py
+
+        # note openpcdet pt = target * (1.0 - p) + (1.0 - target) * p
+        # but others    pt = target * p + (1.0 - target) * (1 - p)
+        # so have to swap pt <-> (1 - pt)
+
+        p = torch.sigmoid(input)
+
+        ce_loss = self.sigmoid_cross_entropy_with_logits(input, target)
+        pt = target * (1.0 - p) + (1.0 - target) * p
+        FL = ce_loss * torch.pow(pt, self.gamma)
+
+        if self.alpha >= 0:
+            alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
+            FL = alpha_t * FL
+
+        loss = FL + self.epsilon * torch.pow(pt, self.gamma + 1)
+
+        if weights.shape.__len__() == 2 or \
+                (weights.shape.__len__() == 1 and target.shape.__len__() == 2):
+            weights = weights.unsqueeze(-1)
+
+        assert weights.shape.__len__() == loss.shape.__len__()
+
+        return loss * weights
 
 class WeightedSmoothL1Loss(nn.Module):
     """
@@ -136,6 +271,24 @@ class WeightedSmoothL1Loss(nn.Module):
 
         return loss
 
+class WeightedSigmoidL1Loss(nn.Module):
+    def __init__(self):
+        super(WeightedSigmoidL1Loss, self).__init__()
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor, weights: torch.Tensor = None):
+        input = torch.sigmoid(input)
+        target = torch.where(torch.isnan(target), input, target)  # ignore nan targets
+
+        diff = input - target
+        loss = torch.abs(diff)
+        
+        if weights is not None:
+            if len(weights.shape) == 1 and weights.shape[0] == loss.shape[0]:
+                loss = loss * weights.unsqueeze(-1)
+            elif len(weights.shape) == 1 and weights.shape[1] == loss.shape[1]:
+                loss = loss * weights.unsqueeze(0)
+
+        return loss
 
 class WeightedL1Loss(nn.Module):
     def __init__(self, code_weights: list = None):
@@ -573,7 +726,6 @@ class L1Loss(nn.Module):
         loss = torch.abs(pred - target)
         return loss
 
-
 class GaussianFocalLoss(nn.Module):
     """GaussianFocalLoss is a variant of focal loss.
 
@@ -597,6 +749,45 @@ class GaussianFocalLoss(nn.Module):
         super(GaussianFocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
+
+    def forward(self, pred, target):
+        eps = 1e-12
+        pos_weights = target.eq(1)
+        neg_weights = (1 - target).pow(self.gamma)
+        pos_loss = -(pred + eps).log() * (1 - pred).pow(self.alpha) * pos_weights
+        neg_loss = -(1 - pred + eps).log() * pred.pow(self.alpha) * neg_weights
+
+        return pos_loss + neg_loss
+
+class GaussianPoly1FocalLoss(nn.Module):
+    def __init__(self,
+                 alpha=2.0,
+                 gamma=4.0,
+                 eps=1.0):
+        super(GaussianPoly1FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.eps = eps
+        assert eps >= -1.0
+
+        self.ce = nn.BCELoss()
+
+    def poly1_focal_loss(self, p, labels):
+        # epsilon >= -1
+        pt = labels * p + (1 - labels) * (1 - p)
+        ce_loss = self.ce(p, labels, reduction='none')
+        FL = ce_loss * ((1 - pt) ** self.gamma)
+
+        alpha_t = self.alpha * labels + (1 - self.alpha) * (1 - labels)
+        
+        Poly1 = FL + self.eps * torch.pow(1 - pt, self.gamma + 1)
+        return Poly1
+
+    """
+        pos_loss = -(pred + eps).log() * (1 - pred).pow(self.alpha) * pos_weights
+                 = - log(pred) * (1 - pred)^alpha * (target) 
+    """
+    
 
     def forward(self, pred, target):
         eps = 1e-12

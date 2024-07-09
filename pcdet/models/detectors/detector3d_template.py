@@ -9,11 +9,24 @@ from .. import backbones_2d, backbones_3d, dense_heads, roi_heads
 from ..backbones_2d import map_to_bev
 from ..backbones_3d import pfe, vfe
 from ..model_utils import model_nms_utils
+from pcdet.models.dense_heads import CLIPBoxClassification, GLIPBoxClassification
+from pcdet.models.preprocessed_detector import PreprocessedDetector, PreprocessedGLIP
 
+all_class_names = ['car','truck', 'construction_vehicle', 'bus', 'trailer',
+            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+knowns3_names = ['car', 'bicycle', 'pedestrian']
+knowns6_names = ['car', 'construction_vehicle', 'trailer',
+            'barrier', 'bicycle', 'pedestrian']
+
+known3_labels = [all_class_names.index(x) + 1 for x in knowns3_names]
+known6_labels = [all_class_names.index(x) + 1 for x in knowns6_names]
 
 class Detector3DTemplate(nn.Module):
     def __init__(self, model_cfg, num_class, dataset):
         super().__init__()
+
+        num_class = model_cfg.get('NUM_CLASS', num_class)
+
         self.model_cfg = model_cfg
         self.num_class = num_class
         self.dataset = dataset
@@ -24,6 +37,14 @@ class Detector3DTemplate(nn.Module):
             'vfe', 'backbone_3d', 'map_to_bev_module', 'pfe',
             'backbone_2d', 'dense_head',  'point_head', 'roi_head'
         ]
+
+        post_process_cfg = self.model_cfg.POST_PROCESSING
+        self.vlm = None
+        if post_process_cfg.get('CLIP', False):
+            self.vlm = CLIPBoxClassification(clip_model=post_process_cfg.get('CLIP', 'ViT-L/14'))
+
+        if post_process_cfg.get('GLIP', False):
+            self.vlm = GLIPBoxClassification(model_cfg=self.model_cfg.POST_PROCESSING)
 
     @property
     def mode(self):
@@ -281,6 +302,13 @@ class Detector3DTemplate(nn.Module):
             }
             pred_dicts.append(record_dict)
 
+        if self.vlm is not None:
+            print('clip is not none')
+            pred_dicts = self.vlm(batch_dict, pred_dicts)
+            exit()
+        else:
+            print('clip is none!')
+
         return pred_dicts, recall_dict
 
     @staticmethod
@@ -293,9 +321,22 @@ class Detector3DTemplate(nn.Module):
 
         if recall_dict.__len__() == 0:
             recall_dict = {'gt': 0}
+
+            recall_dict['num_3known'] = 0
+            recall_dict['num_6known'] = 0
+            recall_dict['num_4unknown'] = 0
+            recall_dict['num_7unknown'] = 0
+
             for cur_thresh in thresh_list:
                 recall_dict['roi_%s' % (str(cur_thresh))] = 0
                 recall_dict['rcnn_%s' % (str(cur_thresh))] = 0
+
+                recall_dict['rcnn_3known_%s' % (str(cur_thresh))] = 0
+                recall_dict['rcnn_6known_%s' % (str(cur_thresh))] = 0
+
+                # unknowns
+                recall_dict['rcnn_4unknown_%s' % (str(cur_thresh))] = 0
+                recall_dict['rcnn_7unknown_%s' % (str(cur_thresh))] = 0
 
         cur_gt = gt_boxes
         k = cur_gt.__len__() - 1
@@ -304,8 +345,24 @@ class Detector3DTemplate(nn.Module):
         cur_gt = cur_gt[:k + 1]
 
         if cur_gt.shape[0] > 0:
+            labels = cur_gt[:, -1].long().cpu().numpy()
+
+            known3_mask = torch.zeros((cur_gt.shape[0], ), dtype=torch.bool, device=cur_gt.device)
+            known6_mask = torch.zeros((cur_gt.shape[0], ), dtype=torch.bool, device=cur_gt.device)
+
+            for idx, label in enumerate(labels):
+                known3_mask[idx] = label in known3_labels
+                known6_mask[idx] = label in known6_labels
+
+            # number of knowns / unknowns
+            recall_dict['num_3known'] += known3_mask.sum().item()
+            recall_dict['num_6known'] += known6_mask.sum().item()
+            recall_dict['num_7unknown'] += (~known3_mask).sum().item()
+            recall_dict['num_4unknown'] += (~known6_mask).sum().item()
+
             if box_preds.shape[0] > 0:
                 iou3d_rcnn = iou3d_nms_utils.boxes_iou3d_gpu(box_preds[:, 0:7], cur_gt[:, 0:7])
+
             else:
                 iou3d_rcnn = torch.zeros((0, cur_gt.shape[0]))
 
@@ -318,6 +375,20 @@ class Detector3DTemplate(nn.Module):
                 else:
                     rcnn_recalled = (iou3d_rcnn.max(dim=0)[0] > cur_thresh).sum().item()
                     recall_dict['rcnn_%s' % str(cur_thresh)] += rcnn_recalled
+
+                    # calculate for knowns
+                    known3_recalled = ((iou3d_rcnn.max(dim=0)[0] > cur_thresh) & known3_mask).sum().item()
+                    known6_recalled = ((iou3d_rcnn.max(dim=0)[0] > cur_thresh) & known6_mask).sum().item()
+
+                    # calculate for unknowns
+                    unknown7_recalled = ((iou3d_rcnn.max(dim=0)[0] > cur_thresh) & (~known3_mask)).sum().item()
+                    unknown4_recalled = ((iou3d_rcnn.max(dim=0)[0] > cur_thresh) & (~known6_mask)).sum().item()
+
+                    recall_dict['rcnn_3known_%s' % (str(cur_thresh))] += known3_recalled
+                    recall_dict['rcnn_6known_%s' % (str(cur_thresh))] += known6_recalled
+                    recall_dict['rcnn_7unknown_%s' % (str(cur_thresh))] += unknown7_recalled
+                    recall_dict['rcnn_4unknown_%s' % (str(cur_thresh))] += unknown4_recalled
+
                 if rois is not None:
                     roi_recalled = (iou3d_roi.max(dim=0)[0] > cur_thresh).sum().item()
                     recall_dict['roi_%s' % str(cur_thresh)] += roi_recalled
@@ -350,6 +421,9 @@ class Detector3DTemplate(nn.Module):
             if key in state_dict and state_dict[key].shape == val.shape:
                 update_model_state[key] = val
                 # logger.info('Update weight %s: %s' % (key, str(val.shape)))
+            elif key in state_dict:
+                print(f'{key} has invalid shape', key in state_dict, state_dict[key].shape, val.shape)
+                # exit()
 
         if strict:
             self.load_state_dict(update_model_state)
@@ -376,6 +450,8 @@ class Detector3DTemplate(nn.Module):
             logger.info('==> Checkpoint trained from version: %s' % version)
 
         state_dict, update_model_state = self._load_state_dict(model_state_disk, strict=False)
+
+        sd = self.state_dict()
 
         for key in state_dict:
             if key not in update_model_state:

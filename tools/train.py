@@ -17,10 +17,55 @@ from pcdet.utils import common_utils
 from train_utils.optimization import build_optimizer, build_scheduler
 from train_utils.train_utils import train_model
 
+import wandb
+import numpy
+
+from typing import Union, Optional, Dict, List
+
+class WandbSummaryWriter:
+    def __init__(self, log_dir, cfg_file, args) -> None:
+        
+        self.log_dir = log_dir
+        self.step = 0
+
+        self.last_update = {}
+
+        run_name = Path(cfg_file).stem if args.run_name is None else args.run_name
+        # wandb.init(project='OpenPCDet', name=Path(cfg_file).stem, dir=log_dir)
+        wandb.init(project='OpenPCDet', name=run_name, dir=log_dir)
+
+        # wandb.config(dict(cfg_file=Path(cfg_file).stem))
+
+
+    def add_scalar(
+            self,
+            tag: str,
+            scalar_value: Union[float, numpy.ndarray],
+            global_step: Optional[int] = None,
+            walltime: Optional[float] = None,
+            display_name: Optional[str] = "",
+            summary_description: Optional[str] = ""):
+        
+        if tag not in self.last_update:
+            self.last_update[tag] = scalar_value
+        else:
+            # only log when see a tag twice
+            wandb.log(self.last_update)
+            self.last_update = {}
+
+        # if tag in self.last_update and self.step < self.last_update[tag]:
+        #     self.step += 1
+
+        # self.last_update[tag] = self.step
+
+        # print("add scalar", tag, scalar_value, self.step)
+
+        # wandb.log({tag: scalar_value}, step=self.step)
 
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
+    parser.add_argument('--run_name', type=str, default=None, help='specify the run name for training')
 
     parser.add_argument('--batch_size', type=int, default=None, required=False, help='batch size for training')
     parser.add_argument('--epochs', type=int, default=None, required=False, help='number of epochs to train for')
@@ -111,7 +156,8 @@ def main():
     if cfg.LOCAL_RANK == 0:
         os.system('cp %s %s' % (args.cfg_file, output_dir))
 
-    tb_log = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
+    # tb_log = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
+    tb_log = WandbSummaryWriter(log_dir=output_dir, cfg_file=args.cfg_file, args=args) if cfg.LOCAL_RANK == 0 else None
 
     logger.info("----------- Create dataloader & network & optimizer -----------")
     train_set, train_loader, train_sampler = build_dataloader(
@@ -159,7 +205,7 @@ def main():
 
     model.train()  # before wrap to DistributedDataParallel to support fixed some parameters
     if dist_train:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[cfg.LOCAL_RANK % torch.cuda.device_count()])
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[cfg.LOCAL_RANK % torch.cuda.device_count()], find_unused_parameters=False)
     logger.info(f'----------- Model {cfg.MODEL.NAME} created, param count: {sum([m.numel() for m in model.parameters()])} -----------')
     logger.info(model)
 

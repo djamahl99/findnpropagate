@@ -1,0 +1,94 @@
+CLASS_NAMES: ['car','truck', 'construction_vehicle', 'bus', 'trailer',
+              'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+# CLASS_NAMES: ['truck', 'bus','motorcycle','traffic_cone']
+
+
+DATA_CONFIG:
+    _BASE_CONFIG_: cfgs/dataset_configs/nuscenes_dataset.yaml
+    POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+    # POINT_CLOUD_RANGE: [-15.0, -15.0, -5.0, 15.0, 15.0, 3.0]
+    # FILTER_MIN_POINTS_IN_GT: 0
+    BALANCED_RESAMPLING: False
+    MAX_SWEEPS: 1
+
+
+    CAMERA_CONFIG:
+        USE_CAMERA: True
+        CAM_WITHOUT_IMAGE: True
+        IMAGE:
+            FINAL_DIM: [900, 1600]
+            RESIZE_LIM_TRAIN: [1.0, 1.0]
+            RESIZE_LIM_TEST: [1.0, 1.0]
+
+    DATA_AUGMENTOR:
+        DISABLE_AUG_LIST: ['placeholder', 'random_world_flip', 'random_world_rotation', 'random_world_scaling', 'random_world_translation']
+        AUG_CONFIG_LIST:
+            # - NAME: random_world_flip
+            #   ALONG_AXIS_LIST: ['x', 'y']
+
+            # - NAME: random_world_rotation
+            #   WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]
+
+            # - NAME: random_world_scaling
+            #   WORLD_SCALE_RANGE: [0.9, 1.1]
+
+            # - NAME: random_world_translation
+            #   NOISE_TRANSLATE_STD: [0.5, 0.5, 0.5]
+            
+            # - NAME: imgaug
+            #   ROT_LIM: [0, 0]
+            #   RAND_FLIP: False
+
+    DATA_PROCESSOR:
+        - NAME: mask_points_and_boxes_outside_range
+          REMOVE_OUTSIDE_BOXES: True
+
+        - NAME: shuffle_points
+          SHUFFLE_ENABLED: {
+            'train': False,
+            'test': False
+          }
+
+        # - NAME: transform_points_to_voxels
+        #   VOXEL_SIZE: [0.075, 0.075, 0.2]
+        #   MAX_POINTS_PER_VOXEL: 10
+        #   MAX_NUMBER_OF_VOXELS: {
+        #     'train': 120000,
+        #     'test': 160000
+        #   }
+
+        # - NAME: image_calibrate
+        
+        # - NAME: image_normalize
+        #   mean: [0.0, 0.0, 0.0]
+        #   std: [1.0, 1.0, 1.0]
+
+        #   mean: [0.485, 0.456, 0.406]
+        #   std: [0.229, 0.224, 0.225]
+
+
+
+MODEL:
+    NAME: TransFusion
+
+
+    DENSE_HEAD:
+        CLASS_AGNOSTIC: False
+        NAME: FrustumProposerOG
+        INPUT_FEATURES: 128 # doesn't mean anything (no bev backbone)
+
+        PREDS_PATH: 'PreprocessedGLIP'
+        BOX_FORMAT: 'xyxy'
+
+        PARAMS: {'lq': 0.0, 'uq': 0.25, 'cq': 1.0, 'iou_w': 1.0, 'nms_normal': 1.0, 'dst_w': 0.0, 'dns_w': 1.0, 'min_cam_iou': 0.3, 'score_thr': 0.45, 'nms_2d': 0.4, 'nms_3d': 0.0, 'clamp_bottom': 1, 'num_sizes': 1}
+
+        
+    POST_PROCESSING:
+        RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+        SCORE_THRESH: 0.0
+        OUTPUT_RAW_SCORE: False
+        EVAL_METRIC: kitti
+
+# need for batch size only
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 1
